@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """
-Experimental **Attention sidecar** (A‑Vindex sketch) for the Colab layout used by `vindex.py`.
+**A-Vindex attention sidecar** — vindex-only build + probe.
 
-What it does (offline)
------------------------
-For each layer and each **KV head** (GQA‑aware), clusters a sample of vocabulary rows
-projected through that head’s **k_proj** slice:
-
-    projected[token] = embedding[token] @ K_h.T    # shape (head_dim_kv,)
-
-Then writes **MiniBatchKMeans** centroids to `attn_centroids.bin` plus `attn_index.json`.
-
-This is **not** a replacement for runtime attention (no RoPE, no Q, no softmax over
-sequence positions). It is a **searchable summary** of “where token embeddings land
-under K” for analysis / routing experiments.
+What this module does
+---------------------
+* **Build** (one-shot, needs the HF safetensors once): for each layer and each
+  KV head, projects a vocabulary sample through ``self_attn.k_proj`` and writes
+  ``attn_centroids.bin`` (MiniBatchKMeans clusters). It also writes
+  ``k_proj_weights.bin`` so the probe and scan paths never need the source
+  model again.
+* **Probe** (vindex-only): tokenises the prompt with ``tokenizer.json`` already
+  inside the vindex, looks the last-token embedding up in ``embeddings.bin``,
+  applies the stored ``k_proj`` slice, and returns the closest centroid in
+  cosine similarity. **No Hugging Face model load, no transformers, no
+  torchvision.**
 
 Layout (alongside an existing browse vindex directory)
 ------------------------------------------------------
-  <vindex_dir>/attn_centroids.bin
-  <vindex_dir>/attn_index.json
+  <vindex_dir>/attn_centroids.bin       # MiniBatchKMeans centroids, f32
+  <vindex_dir>/attn_k_proj_weights.bin  # full k_proj per layer, f32  (NEW)
+  <vindex_dir>/attn_index.json          # offsets, shapes, k_proj layout
 
 Dependencies
 ------------
-  pip install torch safetensors numpy scikit-learn
-  Needs `vindex.py` on disk: same folder as this file, current working directory,
-  or set **VINDEX_PY** to the full path of `vindex.py` (Colab-friendly when pasting one cell).
+  pip install torch safetensors numpy scikit-learn tokenizers
+  Needs ``vindex.py`` on disk: same folder as this file, current working
+  directory, or set ``VINDEX_PY`` to the full path of ``vindex.py``.
 
 Env (notebook, empty argv)
 --------------------------
@@ -33,9 +34,10 @@ Env (notebook, empty argv)
   VINDEX_DIR            output vindex directory
   AVINDEX_CENTROIDS=256
   AVINDEX_VOCAB_SAMPLE=8000
-  AVINDEX_PROBE=1       run an honest probe (needs model weights for k_proj)
-  AVINDEX_PROBE_KV_HEAD  default 0
-  VINDEX_PY              optional absolute path to vindex.py (when not importable as `vindex`)
+  AVINDEX_PROBE=1       run the vindex-only probe after extract (no HF model needed)
+  AVINDEX_PROBE_LAYER   optional explicit layer (else middle of knowledge band)
+  AVINDEX_PROBE_KV_HEAD default 0
+  VINDEX_PY             optional absolute path to vindex.py
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ import argparse
 import importlib.util
 import json
 import os
+import struct
 import sys
 import time
 from pathlib import Path
@@ -89,7 +92,6 @@ def _scripts_dir() -> Path:
 
 
 def _candidate_vindex_py_paths() -> list[Path]:
-    """Search order for vindex.py when `import vindex` fails (single-cell Colab)."""
     raw: list[Path] = []
     ev = os.environ.get("VINDEX_PY", "").strip()
     if ev:
@@ -112,7 +114,6 @@ def _candidate_vindex_py_paths() -> list[Path]:
 
 
 def _load_vindex_from_path(py_path: Path) -> Any:
-    """Load vindex.py by path; register sys.modules so @dataclass in vindex works."""
     name = "vindex_colab_avindex"
     spec = importlib.util.spec_from_file_location(name, py_path)
     if spec is None or spec.loader is None:
@@ -141,7 +142,7 @@ def _import_vindex() -> Any:
     raise RuntimeError(
         "Could not import `vindex`. Options:\n"
         "  • Run from the repo folder where `vindex.py` lives, or paste `vindex.py` in cwd.\n"
-        "  • Set VINDEX_PY to the full path of vindex.py (file or directory containing it).\n"
+        "  • Set VINDEX_PY to the full path of vindex.py.\n"
         f"  Tried: {tried}"
     )
 
@@ -159,14 +160,12 @@ def _work_base() -> Path:
 
 
 def _reshape_k_proj(
-    wk: "torch.Tensor",
+    wk: Any,
     *,
     n_kv: int,
     hidden: int,
 ) -> tuple[Any, int]:
     """Return (wk_kv, head_dim_kv) with wk_kv shape [n_kv, head_dim_kv, hidden]."""
-    import torch
-
     if wk.shape[1] == hidden and wk.shape[0] % n_kv == 0:
         pass
     elif wk.shape[0] == hidden and wk.shape[1] % n_kv == 0:
@@ -191,7 +190,11 @@ def extract_attention_avindex(
     random_state: int = 42,
 ) -> Path:
     """
-    Build attn_centroids.bin + attn_index.json under ``out_dir`` (existing vindex folder OK).
+    Build ``attn_centroids.bin`` + ``attn_k_proj_weights.bin`` + ``attn_index.json``
+    under ``out_dir`` (an existing browse vindex directory is fine).
+
+    After this runs, no further script needs the original safetensors: the probe
+    and scan paths read everything they need straight from the vindex directory.
     """
     from sklearn.cluster import MiniBatchKMeans
 
@@ -247,7 +250,7 @@ def extract_attention_avindex(
     _log(f"         drawn vocab_sample={n_sample} rows for clustering")
 
     attn_index: dict[str, Any] = {
-        "avindex_version": 2,
+        "avindex_version": 3,  # bumped: now includes k_proj_weights
         "kind": "k_proj_vocab_projection_centroids",
         "num_layers": num_layers,
         "num_attention_heads": n_heads,
@@ -257,12 +260,14 @@ def extract_attention_avindex(
         "num_centroids": int(num_centroids),
         "dtype": "f32",
         "layers": [],
+        "k_proj_layers": [],  # offsets into attn_k_proj_weights.bin
     }
 
     centroid_path = out_dir / "attn_centroids.bin"
+    kproj_path = out_dir / "attn_k_proj_weights.bin"
     t_all = time.perf_counter()
 
-    with open(centroid_path, "wb") as f_bin:
+    with open(centroid_path, "wb") as f_bin, open(kproj_path, "wb") as f_k:
         for layer in range(num_layers):
             t_l = time.perf_counter()
             k_key = vx.find_key(
@@ -278,10 +283,30 @@ def extract_attention_avindex(
                 "head_dim_kv": head_dim_kv,
                 "kv_heads": [],
             }
+            kproj_entry: dict[str, Any] = {
+                "layer": layer,
+                "head_dim_kv": head_dim_kv,
+                "kv_heads": [],
+            }
 
             for kv_h in range(n_kv):
-                head_k = wk_kv[kv_h]
-                projected = emb_s @ head_k.numpy().T
+                head_k = wk_kv[kv_h].contiguous()
+                head_k_np = np.ascontiguousarray(head_k.numpy(), dtype=np.float32)
+
+                # 1) Save the raw k_proj slice so the probe can run vindex-only.
+                k_offset = f_k.tell()
+                f_k.write(head_k_np.tobytes(order="C"))
+                kproj_entry["kv_heads"].append(
+                    {
+                        "kv_head": kv_h,
+                        "offset": int(k_offset),
+                        "size_bytes": int(head_k_np.nbytes),
+                        "shape": [int(head_k_np.shape[0]), int(head_k_np.shape[1])],
+                    }
+                )
+
+                # 2) Cluster the projected vocabulary sample.
+                projected = emb_s @ head_k_np.T
                 k_use = min(int(num_centroids), int(projected.shape[0]))
                 km = MiniBatchKMeans(
                     n_clusters=k_use,
@@ -291,24 +316,29 @@ def extract_attention_avindex(
                 )
                 km.fit(projected)
                 centroids = np.ascontiguousarray(km.cluster_centers_, dtype=np.float32)
-                offset = f_bin.tell()
+                c_offset = f_bin.tell()
                 f_bin.write(centroids.tobytes(order="C"))
                 layer_entry["kv_heads"].append(
                     {
                         "kv_head": kv_h,
-                        "offset": int(offset),
+                        "offset": int(c_offset),
                         "size_bytes": int(centroids.nbytes),
                         "shape": [int(centroids.shape[0]), int(centroids.shape[1])],
                     }
                 )
             attn_index["layers"].append(layer_entry)
+            attn_index["k_proj_layers"].append(kproj_entry)
             _log(f"  layer {layer + 1}/{num_layers}  kv_heads={n_kv}  ({time.perf_counter() - t_l:.1f}s)")
 
     attn_index["head_dim_kv"] = attn_index["layers"][0]["head_dim_kv"] if num_layers else None
     (out_dir / "attn_index.json").write_text(json.dumps(attn_index, indent=2), encoding="utf-8")
     sz_mb = centroid_path.stat().st_size / (1024 * 1024)
+    sz_k_mb = kproj_path.stat().st_size / (1024 * 1024)
     _log("=" * 60)
-    _log(f"DONE  {centroid_path}  ({sz_mb:.2f} MiB)  total {time.perf_counter() - t_all:.1f}s")
+    _log(
+        f"DONE  centroids={sz_mb:.2f} MiB  k_proj={sz_k_mb:.2f} MiB  "
+        f"total {time.perf_counter() - t_all:.1f}s"
+    )
     return out_dir
 
 
@@ -317,13 +347,15 @@ def extract_attention_avindex(
 
 class AvindexAttentionReader:
     """
-    mmap-friendly sequential file; uses seek+read. Call ``close()`` or use as context manager.
+    Reads ``attn_centroids.bin`` and ``attn_k_proj_weights.bin`` from a vindex
+    directory. Sequential file access via ``seek+read``; cheap per-call cache.
     """
 
     def __init__(self, vindex_dir: Path) -> None:
         self.vindex_dir = vindex_dir.resolve()
         p_meta = self.vindex_dir / "attn_index.json"
         p_bin = self.vindex_dir / "attn_centroids.bin"
+        p_k = self.vindex_dir / "attn_k_proj_weights.bin"
         if not p_meta.is_file():
             raise FileNotFoundError(f"Missing {p_meta} — run extract_attention_avindex first.")
         if not p_bin.is_file():
@@ -332,10 +364,13 @@ class AvindexAttentionReader:
         self._normalize_meta_layers()
         self._bin_path = p_bin
         self._fp = open(p_bin, "rb")
-        self._cache: dict[tuple[int, int], np.ndarray] = {}
+        # k_proj is optional for old (v2) bundles; for v3+ we expect it.
+        self._k_path = p_k
+        self._fp_k: Any | None = open(p_k, "rb") if p_k.is_file() else None
+        self._cache_centroids: dict[tuple[int, int], np.ndarray] = {}
+        self._cache_kproj: dict[tuple[int, int], np.ndarray] = {}
 
     def _normalize_meta_layers(self) -> None:
-        """Coerce ``layers`` to a list[dict] and alias legacy ``heads`` / ``head`` → ``kv_heads``."""
         raw = self.meta.get("layers")
         if raw is None:
             raise KeyError("attn_index.json missing top-level 'layers'")
@@ -363,7 +398,6 @@ class AvindexAttentionReader:
 
     @staticmethod
     def _heads_array(layer_entry: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return per-KV-head centroid metadata (after ``_normalize_meta_layers``)."""
         if "kv_heads" in layer_entry:
             return list(layer_entry["kv_heads"])
         if "heads" in layer_entry:
@@ -390,6 +424,8 @@ class AvindexAttentionReader:
 
     def close(self) -> None:
         self._fp.close()
+        if self._fp_k is not None:
+            self._fp_k.close()
 
     def __enter__(self) -> AvindexAttentionReader:
         return self
@@ -397,10 +433,21 @@ class AvindexAttentionReader:
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    @property
+    def num_layers(self) -> int:
+        return len(self.meta["layers"])
+
+    @property
+    def hidden_size(self) -> int:
+        return int(self.meta.get("hidden_size", 0))
+
+    def n_kv_for_layer(self, layer: int) -> int:
+        return len(self._heads_array(self.meta["layers"][layer]))
+
     def centroids(self, layer: int, kv_head: int) -> np.ndarray:
         key = (layer, kv_head)
-        if key in self._cache:
-            return self._cache[key]
+        if key in self._cache_centroids:
+            return self._cache_centroids[key]
         layer_entry = self.meta["layers"][layer]
         heads = self._heads_array(layer_entry)
         hm = heads[kv_head]
@@ -419,18 +466,48 @@ class AvindexAttentionReader:
                 )
             k = nbytes // (4 * d)
             arr = np.frombuffer(raw, dtype=np.float32).reshape(int(k), int(d))
-        self._cache[key] = arr
+        self._cache_centroids[key] = arr
+        return arr
+
+    def k_slice(self, layer: int, kv_head: int) -> np.ndarray:
+        """
+        Return the stored ``k_proj`` slice for a given (layer, kv_head),
+        shape ``[head_dim_kv, hidden]``. Reads ``attn_k_proj_weights.bin``;
+        raises ``FileNotFoundError`` for legacy bundles without the file.
+        """
+        if self._fp_k is None:
+            raise FileNotFoundError(
+                f"{self._k_path} is missing — this vindex was built with an older "
+                "avindex_attention.py (avindex_version<3). Re-run extract to bake "
+                "k_proj into the vindex."
+            )
+        key = (layer, kv_head)
+        if key in self._cache_kproj:
+            return self._cache_kproj[key]
+        kproj_layers = self.meta.get("k_proj_layers")
+        if not kproj_layers:
+            raise KeyError("attn_index.json missing 'k_proj_layers' (re-run extract).")
+        entry = kproj_layers[layer]
+        heads = entry.get("kv_heads") or []
+        hm = heads[kv_head]
+        self._fp_k.seek(int(hm["offset"]))
+        raw = self._fp_k.read(int(hm["size_bytes"]))
+        sh = hm.get("shape")
+        if not (isinstance(sh, list) and len(sh) == 2):
+            raise ValueError("k_proj entry missing 'shape' — re-run extract.")
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(int(sh[0]), int(sh[1]))
+        self._cache_kproj[key] = arr
         return arr
 
     def nearest_cosine(self, layer: int, kv_head: int, q: np.ndarray) -> tuple[int, float]:
         """Unit-norm cosine similarity → best centroid index and score in [-1, 1]."""
         q = np.asarray(q, dtype=np.float32).reshape(-1)
-        C = self.centroids(layer, kv_head)
-        if q.shape[0] != C.shape[1]:
-            raise ValueError(f"query dim {q.shape[0]} != head_dim_kv {C.shape[1]}")
+        c = self.centroids(layer, kv_head)
+        if q.shape[0] != c.shape[1]:
+            raise ValueError(f"query dim {q.shape[0]} != head_dim_kv {c.shape[1]}")
         qn = q / (np.linalg.norm(q) + 1e-8)
-        Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-8)
-        sims = Cn @ qn
+        cn = c / (np.linalg.norm(c, axis=1, keepdims=True) + 1e-8)
+        sims = cn @ qn
         j = int(np.argmax(sims))
         return j, float(sims[j])
 
@@ -454,184 +531,125 @@ def load_embeddings_f32(vindex_dir: Path, vocab: int, hidden: int) -> np.ndarray
     return raw.reshape(vocab, hidden)
 
 
-def load_k_slice_torch(
-    model_dir: Path,
-    layer: int,
-    kv_head: int,
-    *,
-    n_kv: int,
-    hidden: int,
-) -> Any:
-    """Load k_proj once per call; prefer :class:`KProjWeightCache` in hot loops."""
-    return KProjWeightCache(model_dir).k_slice(layer, kv_head, n_kv=n_kv, hidden=hidden)
+# ── vindex-only tokenizer ─────────────────────────────────────────────────
 
 
-class KProjWeightCache:
-    """Single ``load_safetensors_dir``; cheap per-(layer, kv_head) k_proj slices."""
-
-    def __init__(self, model_dir: Path) -> None:
-        vx = _import_vindex()
-        self._vx = vx
-        self.model_dir = Path(model_dir).resolve()
-        _log(f"KProjWeightCache: loading safetensors from {self.model_dir} …")
-        t0 = time.perf_counter()
-        self.sd = vx.load_safetensors_dir(self.model_dir)
-        self.prefix = vx.detect_prefix(list(self.sd.keys()))
-        _log(f"KProjWeightCache: ready in {time.perf_counter() - t0:.2f}s ({len(self.sd)} tensors)")
-
-    def k_slice(self, layer: int, kv_head: int, *, n_kv: int, hidden: int) -> Any:
-        import torch
-
-        k_key = self._vx.find_key(
-            self.sd,
-            f"{self.prefix}layers.{layer}.self_attn.k_proj.weight",
-            f"model.layers.{layer}.self_attn.k_proj.weight",
+def load_vindex_tokenizer(vindex_dir: Path) -> Any:
+    """Load ``tokenizer.json`` straight from the vindex (no HF model id required)."""
+    p = Path(vindex_dir).resolve() / "tokenizer.json"
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"{p} missing — vindex.py copies tokenizer.json next to embeddings.bin."
         )
-        wk = self.sd[k_key].to(torch.float32)
-        wk_kv, _ = _reshape_k_proj(wk, n_kv=n_kv, hidden=hidden)
-        return wk_kv[kv_head].contiguous()
+    try:
+        from tokenizers import Tokenizer  # type: ignore
+    except ImportError as e:
+        raise SystemExit(
+            "Install the `tokenizers` package: pip install tokenizers"
+        ) from e
+    return Tokenizer.from_file(str(p))
 
 
-def _kv_heads_list_raw(layer_entry: dict[str, Any]) -> list[Any]:
-    return list(layer_entry.get("kv_heads") or layer_entry.get("heads") or [])
+def _encode_prompt(tok: Any, prompt: str) -> list[int]:
+    enc = tok.encode(prompt)
+    ids = list(enc.ids)
+    if not ids:
+        raise ValueError("empty tokenization")
+    return ids
 
 
-def _n_kv_for_probe(attn: dict[str, Any], main: dict[str, Any], layer: int) -> int:
-    """
-    KV head count for k_proj reshape: prefer on-disk attn layout (matches centroids),
-    then attn_index / index.json metadata.
-    """
-    layers = _attn_layers_normalized(attn)
-    if layer < 0 or layer >= len(layers):
-        raise IndexError(f"attn layer {layer} out of range (0..{len(layers) - 1})")
-    n_from_blocks = len(_kv_heads_list_raw(layers[layer]))
-    n_meta = int(attn.get("num_key_value_heads", 0) or attn.get("num_kv_heads", 0) or 0)
-    mc = main.get("model_config") or {}
-    n_index = int(mc.get("num_kv_heads", mc.get("num_key_value_heads", 0)) or 0)
-    if n_from_blocks > 0:
-        if n_meta > 0 and n_meta != n_from_blocks:
-            _log(
-                f"warning: attn_index num_key_value_heads={n_meta} != len(kv_heads)={n_from_blocks} "
-                f"— using len(kv_heads) so probe matches centroids."
-            )
-        if n_index > 0 and n_index != n_from_blocks:
-            _log(
-                f"warning: index.json num_kv_heads={n_index} != attn len(kv_heads)={n_from_blocks} "
-                f"— using attn layout."
-            )
-        return n_from_blocks
-    if n_meta > 0:
-        return n_meta
-    if n_index > 0:
-        return n_index
-    return 1
+def _decode_one(tok: Any, token_id: int) -> str:
+    try:
+        return tok.decode([int(token_id)])
+    except Exception:  # noqa: BLE001
+        return f"<id {token_id}>"
+
+
+# ── probe / scan (vindex-only) ────────────────────────────────────────────
 
 
 def probe_last_token_k_space(
     vindex_dir: Path,
-    model_dir: Path,
     *,
     prompt: str,
     layer: int,
     kv_head: int = 0,
-    weight_cache: KProjWeightCache | None = None,
+    reader: AvindexAttentionReader | None = None,
 ) -> dict[str, Any]:
     """
-    Honest probe in the **same space as extract**: last prompt token embedding row,
-    multiplied by K_h^T, then nearest centroid (cosine).
+    Honest probe in the **same space as extract** — but vindex-only:
+    last-token embedding row × stored ``k_proj`` slice → nearest centroid (cosine).
 
-    Requires:
-      - attn_index.json + attn_centroids.bin from this script
-      - embeddings.bin + index.json from vindex.py
-      - model_dir safetensors for k_proj (same checkpoint as extract)
+    Requires only files inside ``vindex_dir`` (no HF model, no transformers).
     """
-    from transformers import AutoTokenizer
-
-    vindex_dir = vindex_dir.resolve()
-    model_dir = model_dir.resolve()
+    vindex_dir = Path(vindex_dir).resolve()
     main = json.loads((vindex_dir / "index.json").read_text(encoding="utf-8"))
-    attn = json.loads((vindex_dir / "attn_index.json").read_text(encoding="utf-8"))
-    model_id = str(main.get("model", "")).strip() or None
     vocab = int(main["vocab_size"])
     hidden = int(main["hidden_size"])
-    n_kv = _n_kv_for_probe(attn, main, layer)
 
-    tok = AutoTokenizer.from_pretrained(model_id or str(model_dir), trust_remote_code=True)
-    ids = tok.encode(prompt, add_special_tokens=False)
-    if not ids:
-        raise ValueError("empty tokenization")
+    tok = load_vindex_tokenizer(vindex_dir)
+    ids = _encode_prompt(tok, prompt)
     last = int(ids[-1])
 
     emb = load_embeddings_f32(vindex_dir, vocab, hidden)
     e = emb[last].astype(np.float32)
 
-    import torch
-
-    cache = weight_cache or KProjWeightCache(model_dir)
-    Kh = cache.k_slice(layer, kv_head, n_kv=n_kv, hidden=hidden)
-    q = (torch.from_numpy(e) @ Kh.T).numpy()
-
-    with AvindexAttentionReader(vindex_dir) as r:
+    own = reader is None
+    r = reader or AvindexAttentionReader(vindex_dir)
+    try:
+        kh = r.k_slice(layer, kv_head)
+        q = e @ kh.T
         cid, score = r.nearest_cosine(layer, kv_head, q)
+    finally:
+        if own:
+            r.close()
 
     return {
         "prompt": prompt,
         "last_token_id": last,
-        "last_token_piece": tok.decode([last]),
-        "layer": layer,
-        "kv_head": kv_head,
-        "n_kv_used": n_kv,
-        "centroid_id": cid,
-        "cosine": score,
+        "last_token_piece": _decode_one(tok, last),
+        "layer": int(layer),
+        "kv_head": int(kv_head),
+        "centroid_id": int(cid),
+        "cosine": float(score),
     }
 
 
 def scan_centroid_path(
     vindex_dir: Path,
-    model_dir: Path,
     *,
     prompt: str,
-    weight_cache: KProjWeightCache | None = None,
     layers_only: list[int] | None = None,
+    reader: AvindexAttentionReader | None = None,
 ) -> dict[str, Any]:
     """
-    For **each** (layer, kv_head): project last-token embedding through ``k_proj`` slice,
-    then nearest centroid (cosine). Produces a linear ``steps`` list you can print or
-    filter (this is diagnostic geometry, not full attention).
+    For **each** (layer, kv_head): project last-token embedding through the
+    stored ``k_proj`` slice, then nearest centroid (cosine). Diagnostic only.
     """
-    from transformers import AutoTokenizer
-
-    import torch
-
-    vindex_dir = vindex_dir.resolve()
-    model_dir = model_dir.resolve()
+    vindex_dir = Path(vindex_dir).resolve()
     main = json.loads((vindex_dir / "index.json").read_text(encoding="utf-8"))
-    attn = json.loads((vindex_dir / "attn_index.json").read_text(encoding="utf-8"))
-    model_id = str(main.get("model", "")).strip() or None
     vocab = int(main["vocab_size"])
     hidden = int(main["hidden_size"])
-    layers_arr = _attn_layers_normalized(attn)
-    n_layers = len(layers_arr)
 
-    tok = AutoTokenizer.from_pretrained(model_id or str(model_dir), trust_remote_code=True)
-    ids = tok.encode(prompt, add_special_tokens=False)
-    if not ids:
-        raise ValueError("empty tokenization")
+    tok = load_vindex_tokenizer(vindex_dir)
+    ids = _encode_prompt(tok, prompt)
     last = int(ids[-1])
     emb = load_embeddings_f32(vindex_dir, vocab, hidden)
     e = emb[last].astype(np.float32)
 
-    cache = weight_cache or KProjWeightCache(model_dir)
+    own = reader is None
+    r = reader or AvindexAttentionReader(vindex_dir)
     steps: list[dict[str, Any]] = []
-    layer_iter = layers_only if layers_only is not None else range(n_layers)
-    with AvindexAttentionReader(vindex_dir) as r:
+    try:
+        n_layers = r.num_layers
+        layer_iter = layers_only if layers_only is not None else range(n_layers)
         for layer in layer_iter:
             if layer < 0 or layer >= n_layers:
                 continue
-            n_kv = _n_kv_for_probe(attn, main, layer)
+            n_kv = r.n_kv_for_layer(layer)
             for kv_h in range(n_kv):
-                Kh = cache.k_slice(layer, kv_h, n_kv=n_kv, hidden=hidden)
-                q = (torch.from_numpy(e) @ Kh.T).numpy()
+                kh = r.k_slice(layer, kv_h)
+                q = e @ kh.T
                 cid, score = r.nearest_cosine(layer, kv_h, q)
                 steps.append(
                     {
@@ -641,99 +659,17 @@ def scan_centroid_path(
                         "cosine": float(score),
                     }
                 )
+    finally:
+        if own:
+            r.close()
     return {
         "kind": "a_vindex_centroid_hit_per_kv_head",
         "prompt": prompt,
         "last_token_id": last,
-        "last_token_piece": tok.decode([last]),
+        "last_token_piece": _decode_one(tok, last),
         "steps": steps,
         "num_steps": len(steps),
     }
-
-
-def _transformers_skip_torchvision_for_text_models() -> None:
-    """
-    Qwen3 causal LM import can transitively import ``torchvision`` (vision utils).
-    On Colab, mismatched torch/torchvision CUDA wheels raise before the model loads.
-    For **text-only** use we force torchvision to appear unavailable so that path is skipped.
-
-    Set ``AVINDEX_ALLOW_TORCHVISION=1`` to skip this patch (use real torchvision checks).
-    """
-    if os.environ.get("AVINDEX_ALLOW_TORCHVISION", "").strip().lower() in ("1", "true", "yes", "on"):
-        return
-    try:
-        import transformers.utils.import_utils as iu
-
-        if hasattr(iu, "is_torchvision_available"):
-            iu.is_torchvision_available = lambda: False  # type: ignore[assignment]
-    except Exception:
-        return
-    try:
-        import transformers.utils as tu
-
-        if hasattr(tu, "is_torchvision_available"):
-            tu.is_torchvision_available = lambda: False  # type: ignore[assignment]
-    except Exception:
-        pass
-
-
-def hf_next_token_topk(
-    model_ref: str,
-    prompt: str,
-    *,
-    top_k: int = 10,
-) -> list[dict[str, Any]]:
-    """
-    One forward pass, softmax at last position → top-``k`` **token ids** (same spirit
-    as ``vindex-infer`` HF path). This is true next-token **LM** ranking, not A‑Vindex
-    centroid geometry.
-    """
-    _transformers_skip_torchvision_for_text_models()
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as e:
-        raise RuntimeError("pip install transformers torch accelerate") from e
-
-    use_cpu = os.environ.get("AVINDEX_HF_CPU", "").strip().lower() in ("1", "true", "yes", "on")
-    device_map: str | dict[str, str] = "cpu" if use_cpu else "auto"
-    dtype = torch.float32 if use_cpu else torch.float16
-
-    _log(f"hf_next_token_topk: loading model {model_ref!r} (device_map={device_map!r}) …")
-    t0 = time.perf_counter()
-    tok = AutoTokenizer.from_pretrained(model_ref, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_ref,
-        torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-    )
-    _log(f"hf_next_token_topk: weights ready in {time.perf_counter() - t0:.1f}s")
-
-    inputs = tok(prompt, return_tensors="pt")
-    dev = next(model.parameters()).device
-    inputs = {k: v.to(dev) for k, v in inputs.items()}
-    t1 = time.perf_counter()
-    with torch.no_grad():
-        out = model(**inputs)
-    logits = out.logits[0, -1, :].float()
-    probs = torch.softmax(logits, dim=-1)
-    k = min(int(top_k), probs.numel())
-    vals, inds = probs.topk(k)
-    rows: list[dict[str, Any]] = []
-    for rank, (p, tid) in enumerate(zip(vals.tolist(), inds.tolist()), start=1):
-        tid = int(tid)
-        s = tok.decode([tid], skip_special_tokens=True)
-        rows.append(
-            {
-                "rank": rank,
-                "token_id": tid,
-                "token": s if s.strip() else f"<id {tid}>",
-                "prob": float(p),
-            }
-        )
-    _log(f"hf_next_token_topk: forward+topk in {time.perf_counter() - t1:.2f}s")
-    return rows
 
 
 def _default_probe_layer(main_index: dict[str, Any]) -> int:
@@ -746,18 +682,17 @@ def _default_probe_layer(main_index: dict[str, Any]) -> int:
     return max(0, nl // 2)
 
 
+# ── entry points (extract is the only HF-touching path) ───────────────────
+
+
 def run_default_cell() -> None:
     vx = _import_vindex()
     base = vx.work_base()
-    model_id = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
     vdir = Path(os.environ.get("VINDEX_DIR", str(base / "vindex_out"))).expanduser().resolve()
-    mdir = vx.resolve_model_dir(model_id, base / "hf_models")
-
-    if not _env_truthy("AVINDEX_EXTRACT") and not _env_truthy("AVINDEX_PROBE"):
-        _log("nothing to do — set AVINDEX_EXTRACT=1 and/or AVINDEX_PROBE=1")
-        return
 
     if _env_truthy("AVINDEX_EXTRACT"):
+        model_id = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
+        mdir = vx.resolve_model_dir(model_id, base / "hf_models")
         k = int(os.environ.get("AVINDEX_CENTROIDS", "256"))
         vs = int(os.environ.get("AVINDEX_VOCAB_SAMPLE", "8000"))
         extract_attention_avindex(mdir, vdir, num_centroids=k, vocab_sample=vs)
@@ -767,24 +702,32 @@ def run_default_cell() -> None:
         layer = int(os.environ.get("AVINDEX_PROBE_LAYER", str(_default_probe_layer(main))))
         prompt = os.environ.get("AVINDEX_PROMPT", "The capital of France is").strip()
         kv = int(os.environ.get("AVINDEX_PROBE_KV_HEAD", "0"))
-        cache = KProjWeightCache(mdir)
-        out = probe_last_token_k_space(vdir, mdir, prompt=prompt, layer=layer, kv_head=kv, weight_cache=cache)
-        _log("PROBE (embedding × K_h^T vs centroids, last token only)")
+        out = probe_last_token_k_space(vdir, prompt=prompt, layer=layer, kv_head=kv)
+        _log("PROBE (vindex-only: embedding × stored K_h^T vs centroids, last token only)")
         for k, v in out.items():
             _log(f"  {k}: {v!r}")
+        return
+
+    if not _env_truthy("AVINDEX_EXTRACT"):
+        _log("nothing to do — set AVINDEX_EXTRACT=1 and/or AVINDEX_PROBE=1")
 
 
 def main_cli() -> None:
     vx = _import_vindex()
-    ap = argparse.ArgumentParser(description="Attention centroid sidecar for Colab vindex layout")
-    ap.add_argument("command", choices=["extract", "probe"], help="extract centroids or run probe")
-    ap.add_argument("--model-dir", type=Path, default=None, help="HF model folder (safetensors + config)")
-    ap.add_argument("--vindex", type=Path, default=None, help="vindex directory (attn_* + embeddings.bin)")
+    ap = argparse.ArgumentParser(description="A-Vindex attention sidecar (vindex-only probe)")
+    ap.add_argument("command", choices=["extract", "probe", "scan"], help="action to perform")
+    ap.add_argument("--model-dir", type=Path, default=None, help="(extract only) HF safetensors folder")
+    ap.add_argument("--vindex", type=Path, default=None, help="vindex directory")
     ap.add_argument("--centroids", type=int, default=256)
     ap.add_argument("--vocab-sample", type=int, default=8000)
     ap.add_argument("--prompt", "-p", default="The capital of France is")
     ap.add_argument("--layer", type=int, default=-1, help="-1 = middle/knowledge band from index.json")
     ap.add_argument("--kv-head", type=int, default=0)
+    ap.add_argument(
+        "--scan-layers",
+        default="",
+        help='comma-separated layer ids (default: all when scan)',
+    )
     args, rest = ap.parse_known_args(user_argv())
     if rest:
         _log(f"warning: ignored argv: {rest}")
@@ -803,16 +746,21 @@ def main_cli() -> None:
         )
         return
 
-    # probe
-    mid = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
-    mdir = (args.model_dir or vx.resolve_model_dir(mid, base / "hf_models")).resolve()
     main = json.loads((vdir / "index.json").read_text(encoding="utf-8"))
-    layer = args.layer if args.layer >= 0 else _default_probe_layer(main)
-    cache = KProjWeightCache(mdir)
-    out = probe_last_token_k_space(
-        vdir, mdir, prompt=args.prompt, layer=layer, kv_head=args.kv_head, weight_cache=cache
-    )
-    _log("PROBE result:")
+
+    if args.command == "probe":
+        layer = args.layer if args.layer >= 0 else _default_probe_layer(main)
+        out = probe_last_token_k_space(
+            vdir, prompt=args.prompt, layer=layer, kv_head=args.kv_head
+        )
+        _log("PROBE result:")
+        print(json.dumps(out, indent=2))
+        return
+
+    # scan
+    sl = args.scan_layers.strip()
+    layers_only = [int(x.strip()) for x in sl.split(",") if x.strip()] if sl else None
+    out = scan_centroid_path(vdir, prompt=args.prompt, layers_only=layers_only)
     print(json.dumps(out, indent=2))
 
 
