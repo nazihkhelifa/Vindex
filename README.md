@@ -2,20 +2,90 @@
 
 > The model **IS** the database. A pure-Python toolkit that decompiles a
 > Hugging Face transformer into a queryable **vindex** — and then runs
-> inference **straight from the vindex files**, with no Hugging Face model
-> ever loaded after extraction.
+> inference **straight from the vindex files**, reproducing the model's
+> forward pass with **vAttention + vFFN** instead of the original
+> Hugging Face model.
+
+## Project goal
+
+**One sentence:** at inference time, never re-open the original model.
+Read a user prompt, tokenise it, and produce the next-token distribution
+**only from vindex bytes**, via two re-implemented pieces:
+
+| Original model component | Vindex replacement (what runs at inference) | Files read |
+|---|---|---|
+| `self_attn.*` — multi-head causal attention over the prompt | **vAttention** — numpy RMSNorm + RoPE + GQA softmax + `o_proj`, layer by layer over the full token sequence (no HF, no PyTorch model) | `vindex_attn_ctx_*.{json,bin}` + `attn_k_proj_weights.bin` |
+| `mlp.gate_proj` / `up_proj` / `down_proj` — FFN forward | **vFFN walk** — KNN over `gate_vectors` rows + weighted vote from `down_meta` top-K tokens (the LARQL FFN-as-graph idea) | `gate_vectors.bin` + `down_meta.bin` |
+| `embed_tokens` + `lm_head` (approximated) | `embeddings.bin` lookup for input; the `down_meta` top-K stands in for `lm_head` at the vote stage | `embeddings.bin` + `down_meta.bin` |
+
+`vindex-infer.py` / `vindex-infernce-next.py` / `avindex-infer.py` /
+`avindex-infer-next.py` are wired to do exactly that and **import
+neither `transformers` nor a HF `AutoModel`**. The only two scripts
+that ever touch the original model are the **extract** scripts
+(`vindex.py` and `avindex_attention.py extract`), which decompile its
+weights into the vindex once.
+
+This is the same trick LARQL uses on the **FFN** ("the model *is* the
+database"), now extended to the **attention** layer.
+
+### Inference pipeline (vindex-only)
+
+```
+                     ┌──────────────────────────────────────────────┐
+                     │   USER PROMPT  →  tokenizer.json  →  ids[]   │
+                     └──────────────────────────────────────────────┘
+                                          │
+                ids                       ▼
+                ┌──────────────  embeddings.bin  ──────────────┐
+                │ h₀ = embed[ids] (× embed_scale if Gemma)     │
+                └──────────────────────────────────────────────┘
+                                          │
+                                          ▼
+   ┌──────────────────────  vAttention (vindex_attn_context.py)  ──────────────────────┐
+   │  for layer L in 0..N-1:                                                            │
+   │     x = RMSNorm(h, input_layernorm[L])                                             │
+   │     q = x @ q_proj[L].T                                                            │
+   │     k = x @ k_proj[L].T          ← read from attn_k_proj_weights.bin               │
+   │     v = x @ v_proj[L].T                                                            │
+   │     (q,k) = apply_rope(q,k, rope_theta)   (+ optional q_norm/k_norm on Qwen)       │
+   │     attn = softmax( causal_mask( q @ kᵀ / √d ) ) @ v                               │
+   │     h = h + attn @ o_proj[L].T                                                     │
+   │  return h[-1]              ← residual at the last position, full prompt mixed in   │
+   └────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+   ┌─────────────────────────  vFFN walk (vindex-infer.py)  ────────────────────────────┐
+   │  e = h[-1]                                                                         │
+   │  votes = zeros(vocab)                                                              │
+   │  for layer L in walk_layers:                                                       │
+   │     scores = gate_vectors[L] @ e                ← gate_vectors.bin                 │
+   │     for feature f in top-K(scores) (positive):                                     │
+   │        for (tok_id, logit) in down_meta[L][f]:  ← down_meta.bin                    │
+   │            votes[tok_id] += scores[f] * logit                                      │
+   │  return softmax(votes)  →  top-k next tokens                                       │
+   └────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Two boxes, two `.bin` files each, **zero PyTorch model load**. The
+"original model" only lives on disk in the form of those files. If you
+delete the Hugging Face cache after `vindex.py` + `avindex_attention.py
+extract`, the inference scripts keep working.
+
+---
 
 This repo is the "notebook flavour" of the LARQL extraction pipeline: a
 handful of Python scripts that take a Hugging Face model (Qwen, Llama,
 Gemma, Mistral, …) and produce a browsable, labelled, indexable
 `*.vindex/` directory. The project goes one step beyond LARQL on the
 **browse** side by adding an experimental sidecar — the **A-Vindex** —
-which applies the same idea to the **attention** layer.
+which applies the same idea to the **attention** layer, and the
+**attention-context** files that make `vindex-infer` use that attention
+end-to-end at runtime.
 
 After extraction, **every inference script reads only the vindex files**:
 embeddings, gate vectors, down-projection metadata, attention centroids,
-and the stored `k_proj` slices. The original Hugging Face checkpoint is
-never re-loaded.
+the stored `k_proj` slices, and the Q/V/O / norm blob. The original
+Hugging Face checkpoint is never re-loaded.
 
 ```
 # FFN  (vindex.py)            A-Vindex / Attention (avindex_attention.py)
@@ -420,13 +490,21 @@ Any "dense" Hugging Face model using the standard
    memory before casting to `f32`. For Qwen3-0.6B that's ~2 GB, for
    Llama-3-8B plan ~32 GB. After extract, the inference scripts are
    modest (mmap'd embeddings + gates, in-memory down_meta).
-2. **Walk INFER is approximate** — even with the attention-context path, we
-   still skip the **FFN** between transformer layers (no ``up_proj`` /
-   ``down_proj`` forward there), skip ``post_attention_layernorm``, skip the
-   final ``model.norm``, and approximate logits via ``down_meta`` top-K
-   votes instead of a full ``lm_head``. Native ``larql`` on an
-   ``inference``-level vindex is the supported path for exact next-token
-   parity.
+2. **Walk INFER is approximate, on purpose** — at inference time the
+   two re-implemented blocks are **vAttention** (faithful: numpy
+   RMSNorm + RoPE + GQA softmax + `o_proj`, full sequence, every
+   layer) and **vFFN walk** (approximate: top-K gate KNN + `down_meta`
+   token votes, not a real `up_proj`/`down_proj` matmul). What is *not*
+   reproduced from the original model:
+    - the **FFN is not interleaved per layer**. The current pipeline
+      runs the *whole* attention stack first, then runs the FFN-walk
+      *once* on the final residual. The original model would alternate
+      `h += attn_L(h)` and `h += ffn_L(h)` per layer.
+    - `post_attention_layernorm` and the final `model.norm` are skipped.
+    - the `lm_head` is approximated by the `down_meta` top-K votes
+      rather than a full `embed.T` projection.
+   Native ``larql`` on an ``inference``-level vindex is the supported
+   path when you need exact next-token parity.
 3. **A-Vindex centroid probe ≠ runtime attention** — the centroid probe is a
    geometric summary of K-space (clustering), not the causal softmax path.
    The **attention-context** walk, by contrast, does run real RoPE + causal
