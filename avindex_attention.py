@@ -190,21 +190,33 @@ def extract_attention_avindex(
     num_centroids: int = 256,
     vocab_sample: int = 8000,
     random_state: int = 42,
+    force: bool = False,
 ) -> Path:
     """
     Build ``attn_centroids.bin`` + ``attn_k_proj_weights.bin`` + ``attn_index.json``
-    under ``out_dir`` (an existing browse vindex directory is fine).
+    under ``out_dir`` (an existing browse vindex directory is fine). Also calls
+    ``extract_attn_context_sidecar`` so ``vindex_attn_ctx_*`` are written in the
+    same run.
 
-    After this runs, no further script needs the original safetensors: the probe
-    and scan paths read everything they need straight from the vindex directory.
+    Idempotent: when ``out_dir`` already contains every centroid / k_proj /
+    attention-context file and ``force=False``, returns without loading any HF
+    safetensors.
     """
+    out_dir = Path(out_dir).resolve()
+    if not force and avindex_centroids_complete(out_dir) and attn_context_sidecar_complete(out_dir):
+        _log("=" * 60)
+        _log(f"SKIP extract — A-Vindex already complete at {out_dir} (no HF load)")
+        _log(f"  centroids+k_proj: {', '.join(AVINDEX_REQUIRED_FILES)}")
+        _log(f"  attn-context:     {', '.join(ATTN_CTX_REQUIRED_FILES)}")
+        _log("  set force=True (env AVINDEX_FORCE=1, CLI --force) to rebuild")
+        return out_dir
+
     from sklearn.cluster import MiniBatchKMeans
 
     vx = _import_vindex()
     import torch
 
     model_dir = model_dir.resolve()
-    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
@@ -341,12 +353,15 @@ def extract_attention_avindex(
         f"DONE  centroids={sz_mb:.2f} MiB  k_proj={sz_k_mb:.2f} MiB  "
         f"total {time.perf_counter() - t_all:.1f}s"
     )
-    try:
-        from vindex_attn_context import extract_attn_context_sidecar
+    if not force and attn_context_sidecar_complete(out_dir):
+        _log("attention-context sidecar already present — skipping sidecar pass")
+    else:
+        try:
+            from vindex_attn_context import extract_attn_context_sidecar
 
-        extract_attn_context_sidecar(out_dir, sd=sd, prefix=prefix, cfg=cfg, vx=vx)
-    except Exception as e:  # noqa: BLE001
-        _log(f"warning: attention-context sidecar skipped: {e}")
+            extract_attn_context_sidecar(out_dir, sd=sd, prefix=prefix, cfg=cfg, vx=vx)
+        except Exception as e:  # noqa: BLE001
+            _log(f"warning: attention-context sidecar skipped: {e}")
     return out_dir
 
 
@@ -680,6 +695,88 @@ def scan_centroid_path(
     }
 
 
+AVINDEX_REQUIRED_FILES: tuple[str, ...] = (
+    "attn_index.json",
+    "attn_centroids.bin",
+    "attn_k_proj_weights.bin",
+)
+ATTN_CTX_REQUIRED_FILES: tuple[str, ...] = (
+    "vindex_attn_ctx_index.json",
+    "vindex_attn_ctx_weights.bin",
+)
+
+
+def avindex_centroids_complete(out_dir: Path) -> bool:
+    """``True`` if the centroid / k_proj files of the A-Vindex are all present."""
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return False
+    for name in AVINDEX_REQUIRED_FILES:
+        p = out_dir / name
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+    return True
+
+
+def attn_context_sidecar_complete(out_dir: Path) -> bool:
+    """``True`` if both ``vindex_attn_ctx_*`` files are present and non-empty."""
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return False
+    for name in ATTN_CTX_REQUIRED_FILES:
+        p = out_dir / name
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+    return True
+
+
+def extract_attn_context_only(
+    model_dir: Path,
+    out_dir: Path,
+    *,
+    force: bool = False,
+) -> Path:
+    """
+    Standalone re-extract of just the **attention-context sidecar**
+    (``vindex_attn_ctx_*``). Useful when an older A-Vindex was built without it
+    — runs through the HF safetensors only to read Q/V/O + input LN (+ optional
+    Qwen q_norm/k_norm) and writes the sidecar next to ``attn_index.json``.
+
+    Idempotent: returns immediately when both sidecar files are already there
+    and ``force=False`` (no HF safetensors load).
+    """
+    vx = _import_vindex()
+    out_dir = Path(out_dir).resolve()
+    model_dir = Path(model_dir).resolve()
+    if not (out_dir / "attn_index.json").is_file():
+        raise FileNotFoundError(
+            f"{out_dir}/attn_index.json missing — run `extract` first so that "
+            "attn_centroids.bin + attn_k_proj_weights.bin exist alongside the sidecar."
+        )
+
+    if not force and attn_context_sidecar_complete(out_dir):
+        _log("=" * 60)
+        _log(f"SKIP extract-ctx — sidecar already present at {out_dir} (no HF load)")
+        _log(f"  files: {', '.join(ATTN_CTX_REQUIRED_FILES)}")
+        return out_dir
+
+    _log("=" * 60)
+    _log(f"EXTRACT-CTX  model_dir={model_dir}")
+    _log(f"             out_dir={out_dir}")
+    _log("loading safetensors (full load — same RAM cost as `extract`) …")
+    t0 = time.perf_counter()
+    sd = vx.load_safetensors_dir(model_dir)
+    prefix = vx.detect_prefix(list(sd.keys()))
+    _log(f"  prefix={prefix!r}  ({time.perf_counter() - t0:.1f}s)")
+    cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+
+    from vindex_attn_context import extract_attn_context_sidecar
+
+    extract_attn_context_sidecar(out_dir, sd=sd, prefix=prefix, cfg=cfg, vx=vx)
+    _log("OK — vindex_attn_ctx_index.json + vindex_attn_ctx_weights.bin written")
+    return out_dir
+
+
 def _default_probe_layer(main_index: dict[str, Any]) -> int:
     bands = main_index.get("layer_bands") or {}
     kn = bands.get("knowledge")
@@ -698,12 +795,25 @@ def run_default_cell() -> None:
     base = vx.work_base()
     vdir = Path(os.environ.get("VINDEX_DIR", str(base / "vindex_out"))).expanduser().resolve()
 
+    force = _env_truthy("AVINDEX_FORCE")
+
     if _env_truthy("AVINDEX_EXTRACT"):
-        model_id = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
-        mdir = vx.resolve_model_dir(model_id, base / "hf_models")
-        k = int(os.environ.get("AVINDEX_CENTROIDS", "256"))
-        vs = int(os.environ.get("AVINDEX_VOCAB_SAMPLE", "8000"))
-        extract_attention_avindex(mdir, vdir, num_centroids=k, vocab_sample=vs)
+        if not force and avindex_centroids_complete(vdir) and attn_context_sidecar_complete(vdir):
+            _log(f"SKIP extract — A-Vindex already complete at {vdir}  (set AVINDEX_FORCE=1 to rebuild)")
+        else:
+            model_id = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
+            mdir = vx.resolve_model_dir(model_id, base / "hf_models")
+            k = int(os.environ.get("AVINDEX_CENTROIDS", "256"))
+            vs = int(os.environ.get("AVINDEX_VOCAB_SAMPLE", "8000"))
+            extract_attention_avindex(mdir, vdir, num_centroids=k, vocab_sample=vs, force=force)
+
+    if _env_truthy("AVINDEX_EXTRACT_CTX"):
+        if not force and attn_context_sidecar_complete(vdir):
+            _log(f"SKIP extract-ctx — sidecar already present at {vdir}  (set AVINDEX_FORCE=1 to rebuild)")
+        else:
+            model_id = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
+            mdir = vx.resolve_model_dir(model_id, base / "hf_models")
+            extract_attn_context_only(mdir, vdir, force=force)
 
     if _env_truthy("AVINDEX_PROBE"):
         main = json.loads((vdir / "index.json").read_text(encoding="utf-8"))
@@ -723,7 +833,11 @@ def run_default_cell() -> None:
 def main_cli() -> None:
     vx = _import_vindex()
     ap = argparse.ArgumentParser(description="A-Vindex attention sidecar (vindex-only probe)")
-    ap.add_argument("command", choices=["extract", "probe", "scan"], help="action to perform")
+    ap.add_argument(
+        "command",
+        choices=["extract", "extract-ctx", "probe", "scan"],
+        help="action to perform (`extract-ctx` only writes vindex_attn_ctx_*)",
+    )
     ap.add_argument("--model-dir", type=Path, default=None, help="(extract only) HF safetensors folder")
     ap.add_argument("--vindex", type=Path, default=None, help="vindex directory")
     ap.add_argument("--centroids", type=int, default=256)
@@ -736,6 +850,11 @@ def main_cli() -> None:
         default="",
         help='comma-separated layer ids (default: all when scan)',
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-extract even if A-Vindex / sidecar files already exist (default: skip).",
+    )
     args, rest = ap.parse_known_args(user_argv())
     if rest:
         _log(f"warning: ignored argv: {rest}")
@@ -743,7 +862,13 @@ def main_cli() -> None:
     base = vx.work_base()
     vdir = (args.vindex or Path(os.environ.get("VINDEX_DIR", str(base / "vindex_out")))).resolve()
 
+    force = args.force or _env_truthy("AVINDEX_FORCE")
+
     if args.command == "extract":
+        if not force and avindex_centroids_complete(vdir) and attn_context_sidecar_complete(vdir):
+            _log(f"SKIP extract — A-Vindex already complete at {vdir}")
+            _log("  use --force or AVINDEX_FORCE=1 to rebuild from scratch")
+            return
         mid = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
         mdir = (args.model_dir or vx.resolve_model_dir(mid, base / "hf_models")).resolve()
         extract_attention_avindex(
@@ -751,7 +876,18 @@ def main_cli() -> None:
             vdir,
             num_centroids=args.centroids,
             vocab_sample=args.vocab_sample,
+            force=force,
         )
+        return
+
+    if args.command == "extract-ctx":
+        if not force and attn_context_sidecar_complete(vdir):
+            _log(f"SKIP extract-ctx — sidecar already present at {vdir}")
+            _log("  use --force or AVINDEX_FORCE=1 to rebuild from scratch")
+            return
+        mid = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
+        mdir = (args.model_dir or vx.resolve_model_dir(mid, base / "hf_models")).resolve()
+        extract_attn_context_only(mdir, vdir, force=force)
         return
 
     main = json.loads((vdir / "index.json").read_text(encoding="utf-8"))

@@ -297,6 +297,27 @@ def _layer_bands_thirds(n: int) -> dict[str, list[int]]:
     }
 
 
+BROWSE_REQUIRED_FILES: tuple[str, ...] = (
+    "index.json",
+    "embeddings.bin",
+    "gate_vectors.bin",
+    "down_meta.bin",
+    "tokenizer.json",
+)
+
+
+def browse_vindex_is_complete(out_dir: Path) -> bool:
+    """Return ``True`` when every browse vindex file exists and is non-empty."""
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return False
+    for name in BROWSE_REQUIRED_FILES:
+        p = out_dir / name
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+    return True
+
+
 def extract_browse(
     model_dir: Path,
     out_dir: Path,
@@ -307,11 +328,22 @@ def extract_browse(
     save_zip: bool = False,
     copy_to_dir: Path | None = None,
     sync_colab_drive: bool = False,
+    force: bool = False,
 ) -> Path:
     """
     Dense transformer (Qwen2/3-style HF layout): gate_proj, down_proj, embed_tokens.
     Does not support MoE in this minimal script.
+
+    Idempotent: if ``out_dir`` already contains every browse file and ``force``
+    is ``False``, returns without re-downloading anything from Hugging Face.
     """
+    out_dir = out_dir.resolve()
+    if not force and browse_vindex_is_complete(out_dir):
+        _log("=" * 60)
+        _log(f"[vindex] SKIP extract — vindex already complete at {out_dir}")
+        _log(f"[vindex]   files: {', '.join(BROWSE_REQUIRED_FILES)} all present (use force=True to rebuild)")
+        return out_dir
+
     _log("=" * 60)
     _log("[vindex] EXTRACT BROWSE (pure Python) — start")
     _log(f"[vindex]   model_dir={model_dir}")
@@ -319,7 +351,6 @@ def extract_browse(
     _log(f"[vindex]   down_top_k={down_top_k}  feature_batch={feature_batch}")
 
     model_dir = model_dir.resolve()
-    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _log("[vindex] STEP 1/9 — read config.json …")
@@ -525,17 +556,22 @@ def run_default_colab() -> Path:
     base = work_base()
     _log(f"[vindex]   work_base={base}")
     model = os.environ.get("VINDEX_MODEL", "Qwen/Qwen3-0.6B").strip()
-    out = base / "vindex_out"
+    out = (base / "vindex_out").resolve()
     cache = base / "hf_models"
     topk = int(os.environ.get("VINDEX_DOWN_TOP_K", "10"))
-    _log(f"[vindex]   VINDEX_MODEL={model!r}  VINDEX_DOWN_TOP_K={topk}")
+    force = _env_truthy("VINDEX_FORCE")
+    _log(f"[vindex]   VINDEX_MODEL={model!r}  VINDEX_DOWN_TOP_K={topk}  VINDEX_FORCE={force}")
     _log(f"[vindex]   cache_dir={cache}  output_dir={out}")
     _log(
         "[vindex]   persist: set VINDEX_ZIP=1 and/or VINDEX_SYNC_TO_DRIVE=1 "
         "and/or VINDEX_DRIVE_DIR=/path/to/dest (after mounting Drive if needed)"
     )
+    if not force and browse_vindex_is_complete(out):
+        _log(f"[vindex] SKIP — vindex already complete at {out} (no HF download)")
+        _log("[vindex]   set VINDEX_FORCE=1 to rebuild from scratch")
+        return out
     mdir = resolve_model_dir(model, cache)
-    return extract_browse(mdir, out, model_name=model, down_top_k=topk)
+    return extract_browse(mdir, out, model_name=model, down_top_k=topk, force=force)
 
 
 def main_cli() -> None:
@@ -571,17 +607,27 @@ def main_cli() -> None:
         default=None,
         help="Copy vindex directory to this path (overrides VINDEX_DRIVE_DIR env)",
     )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-extract even if the browse vindex files already exist (default: skip).",
+    )
     args, rest = ap.parse_known_args(user_argv())
     if rest:
         _log(f"[vindex] warning: ignored CLI tokens: {rest}")
     out = (args.output or (base / "vindex_out")).resolve()
-    mdir = resolve_model_dir(args.model, args.cache_dir)
+    force = args.force or _env_truthy("VINDEX_FORCE")
     _log("=" * 60)
     _log("[vindex] MODE: CLI")
     _log(
         f"[vindex]   model={args.model!r}  out={out}  "
-        f"cache={args.cache_dir.resolve()}  down_top_k={args.down_top_k}"
+        f"cache={args.cache_dir.resolve()}  down_top_k={args.down_top_k}  force={force}"
     )
+    if not force and browse_vindex_is_complete(out):
+        _log(f"[vindex] SKIP — vindex already complete at {out} (no HF download)")
+        _log("[vindex]   use --force or VINDEX_FORCE=1 to rebuild from scratch")
+        return
+    mdir = resolve_model_dir(args.model, args.cache_dir)
     extract_browse(
         mdir,
         out,
@@ -590,6 +636,7 @@ def main_cli() -> None:
         save_zip=args.zip,
         copy_to_dir=args.copy_to,
         sync_colab_drive=args.sync_drive,
+        force=force,
     )
 
 

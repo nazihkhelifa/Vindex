@@ -130,6 +130,12 @@ python avindex_attention.py extract --vindex ./.larql_colab/vindex_out
 python avindex-infer.py --vindex ./.larql_colab/vindex_out -p "Hello" --walk-topk 10
 ```
 
+> **Idempotent extraction:** all three extract entry points (`vindex.py`,
+> `avindex_attention.py extract`, `avindex_attention.py extract-ctx`)
+> **detect existing vindex files** and skip the HF download entirely when
+> their output is already complete. Pass `--force` (CLI) or set
+> `VINDEX_FORCE=1` / `AVINDEX_FORCE=1` (env) to rebuild from scratch.
+
 > **Windows / PowerShell users:** the Unix-style `VAR=value cmd` syntax used
 > in some examples below does not work in PowerShell. Set environment
 > variables first, then run the script:
@@ -247,9 +253,12 @@ The `vindex.py` pipeline industrialises this view:
   take ``e = h[-1]`` (the last position residual after all attention layers).
   That is exactly *"what the model sees at the final position after mixing
   France + capital + of + is through attention"*, up to f32 numpy fidelity.
-* **Last-token fallback** — if those files are missing or you set
-  ``VINDEX_NO_ATTN_CTX=1`` / ``--no-attention-context``, ``e`` is just
-  ``embed[last_token]`` (the old behaviour).
+* **Prompt mean-pool fallback** — if those files are missing or you set
+  ``VINDEX_NO_ATTN_CTX=1`` / ``--no-attention-context``, ``e`` is a
+  **causal-decay weighted average** of all prompt token embeddings (last
+  token weighted most, previous tokens with `0.85^k` decay). Every prompt
+  token still contributes — but this is **not** real attention. To get real
+  attention back, run ``python avindex_attention.py extract-ctx``.
 
 Then for each FFN walk layer ``L``:
 
@@ -358,7 +367,8 @@ out = av.probe_last_token_k_space(
 | Script (invocation) | Role | Touches HF? |
 |---|---|---|
 | `vindex.py` | Extracts a **browse vindex** (FFN + embed + down_meta) from HF | yes — extract only |
-| `avindex_attention.py extract` | Builds the **A-Vindex sidecar** (centroids + k_proj) | yes — extract only |
+| `avindex_attention.py extract` | Builds the **A-Vindex sidecar** (centroids + k_proj + attention-context) | yes — extract only |
+| `avindex_attention.py extract-ctx` | **Only** writes `vindex_attn_ctx_*` (for older vindexes already containing centroids/k_proj) | yes — extract only |
 | `avindex_attention.py probe` | Stand-alone single-layer **centroid probe** (vindex-only) | no |
 | `avindex_attention.py scan` | Centroid hits for **every** (layer, kv_head) — diagnostic | no |
 | `vindex-infer.py` | Single **INFER top-k** — native larql or pure-numpy walk | **no** |
@@ -390,7 +400,8 @@ VINDEX_PROMPT="The capital of France is"
 VINDEX_TOP_K=5
 VINDEX_WALK_FEATURES=32           # features kept per layer
 VINDEX_WALK_LAYERS=knowledge      # band name or comma list, e.g. "12,13,14"
-VINDEX_NO_ATTN_CTX=1              # skip attention forward; use last-token embed only
+VINDEX_NO_ATTN_CTX=1              # skip attention forward; use prompt mean-pool fallback only
+VINDEX_FORCE=1                    # bypass the idempotent skip on vindex.py (default: skip if files exist)
 
 # ── Chat / multi-token (vindex-infernce-next.py) ─────────────────────
 VNEXT_BUILD=1                     # extract before chat (HF download)
@@ -400,7 +411,9 @@ VNEXT_MAX_TOKENS=256
 VNEXT_STREAM=1
 
 # ── A-Vindex extract (avindex_attention.py) ──────────────────────────
-AVINDEX_EXTRACT=1                 # build the attention sidecar (HF download)
+AVINDEX_EXTRACT=1                 # build the attention sidecar (HF download — skipped if files exist)
+AVINDEX_EXTRACT_CTX=1             # only re-write vindex_attn_ctx_* (HF download — skipped if files exist)
+AVINDEX_FORCE=1                   # bypass the idempotent skip; force re-download + re-write
 AVINDEX_CENTROIDS=256
 AVINDEX_VOCAB_SAMPLE=8000
 
@@ -512,7 +525,13 @@ Any "dense" Hugging Face model using the standard
 4. **Attention-context disk** — ``vindex_attn_ctx_weights.bin`` is ~10 MiB
    per layer on a 1k-hidden / 16-head model (~280 MiB for Qwen3-0.6B's 28
    layers). It is written automatically at the end of ``avindex_attention.py
-   extract``. Older vindexes without these files keep the last-token fallback.
+   extract``. Older vindexes without these files use the **prompt mean-pool
+   fallback** (every token contributes via causal-decay weighting, but no real
+   RoPE/softmax attention). To upgrade an existing vindex without rebuilding
+   centroids, run:
+   ```bash
+   python avindex_attention.py extract-ctx --vindex ./.larql_colab/vindex_out
+   ```
 5. **No real chat template** — `tokenizers.Tokenizer.from_file` reads
    the BPE/Unigram graph from `tokenizer.json` but not the Jinja2 chat
    template embedded in `tokenizer_config.json`. The chat scripts use a

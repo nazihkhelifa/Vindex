@@ -11,10 +11,11 @@ Two execution paths, both vindex-native:
 2. **Pure-numpy walk** (always works, including browse-only vindex from
    ``vindex.py``): run **multi-head causal attention** over the full prompt
    (when ``vindex_attn_ctx_*.bin`` are present — produced by the latest
-   ``avindex_attention.py extract``), take the **last-position residual**, then
-   for each FFN layer score ``gate_vectors @ residual`` and vote via
-   ``down_meta``. If the sidecar is missing, falls back to the last-token
-   embedding only.
+   ``avindex_attention.py extract`` or ``extract-ctx``), take the
+   **last-position residual**, then for each FFN layer score
+   ``gate_vectors @ residual`` and vote via ``down_meta``. If the sidecar is
+   missing, falls back to a **causal-decay mean-pool** of the prompt
+   embeddings (every prompt token contributes; still not real attention).
 
 The tokenizer is read from ``<vindex>/tokenizer.json`` directly via the
 ``tokenizers`` package — no ``AutoTokenizer.from_pretrained`` call, no HF
@@ -154,7 +155,8 @@ class VindexWalkRunner:
          ``k_proj``) → optional Qwen ``q_norm``/``k_norm`` → RoPE → causal
          softmax attention → ``o_proj``; ``h += attn_out`` (no FFN between
          layers). Take ``e = h[-1]``.
-         Else: ``e = embed[last_token]``.
+         Else: causal-decay mean-pool of all prompt embeddings (every token
+         contributes, last token weighted most).
       3. For each FFN walk layer, score ``gate_vectors[layer] @ e``, keep top
          features, accumulate ``down_meta`` votes, softmax → top-k.
     """
@@ -198,20 +200,26 @@ class VindexWalkRunner:
         ctx_idx = self.vindex_dir / "vindex_attn_ctx_index.json"
         ctx_w = self.vindex_dir / "vindex_attn_ctx_weights.bin"
         files_ok = ctx_idx.is_file() and ctx_w.is_file()
-        if use_attention_context is False:
-            want = False
-        elif use_attention_context is True:
-            want = True
-        else:
-            want = files_ok and not _env_truthy("VINDEX_NO_ATTN_CTX")
+        forced_off = _env_truthy("VINDEX_NO_ATTN_CTX") or use_attention_context is False
+        want = (use_attention_context is True) or (files_ok and not forced_off)
+
         if want:
             try:
                 from vindex_attn_context import AttnContextForward
 
                 self._attn_ctx = AttnContextForward(self.vindex_dir)
             except Exception as e:  # noqa: BLE001
-                _log(f"[vindex-infer] attention-context unavailable ({e}); using last-token embedding")
+                _log(f"[vindex-infer] attention-context unavailable ({e}); using prompt mean-pool fallback")
                 self._attn_ctx = None
+        elif not files_ok and not forced_off:
+            _log(
+                "[vindex-infer] WARNING: vindex_attn_ctx_* missing — full-prompt attention is NOT being run.\n"
+                "                Falling back to prompt **mean-pool of token embeddings** (passes every prompt\n"
+                "                token, but no real RoPE/softmax attention). Re-extract to enable real attention:\n"
+                "                  python avindex_attention.py extract-ctx --vindex "
+                f"{self.vindex_dir}\n"
+                "                (or env-mode: AVINDEX_EXTRACT_CTX=1 VINDEX_DIR=... python avindex_attention.py)"
+            )
 
     def _load_tokenizer(self) -> Any:
         p = self.vindex_dir / "tokenizer.json"
@@ -226,13 +234,30 @@ class VindexWalkRunner:
         return Tokenizer.from_file(str(p))
 
     def embedding_for_ffn_walk(self, token_ids: list[int]) -> np.ndarray:
-        """Last-position vector fed into the FFN gate KNN: attention-mixed
-        residual when ``_attn_ctx`` is loaded, else last-token embedding."""
+        """Last-position vector fed into the FFN gate KNN.
+
+        * Best path — ``vindex_attn_ctx_*`` loaded: real causal-attention stack
+          over the **entire prompt**, return ``h[-1]``.
+        * Fallback path — sidecar missing: **causal-decay mean-pool** of the
+          token embeddings (every prompt token contributes, with an
+          exponentially decaying weight; bias toward the last token). This is
+          NOT real attention but at least uses the whole prompt instead of
+          ``embed[last_token]`` alone.
+        """
         if self._attn_ctx is not None:
             return self._attn_ctx.last_residual_after_attention(
                 self.embed, self.embed_scale, token_ids
             )
-        return np.asarray(self.embed[int(token_ids[-1])], dtype=np.float32) * self.embed_scale
+        ids = np.asarray([int(t) for t in token_ids], dtype=np.int64)
+        if ids.size == 0:
+            raise ValueError("empty token_ids")
+        embs = np.asarray(self.embed[ids], dtype=np.float32) * float(self.embed_scale)
+        n = int(embs.shape[0])
+        # decay = 0.85: last token weight 1.0, previous 0.85, then 0.7225, ...
+        decay = 0.85
+        w = np.array([decay ** (n - 1 - i) for i in range(n)], dtype=np.float32)
+        w /= float(w.sum())
+        return (embs * w[:, None]).sum(axis=0)
 
     # ── public helpers ────────────────────────────────────────────────────
 
@@ -473,7 +498,11 @@ def run_infer(
     out = runner.infer_topk(
         prompt, top_k=top_k, features_per_layer=features_per_layer, layers=layers
     )
-    ctx_note = "attention→last residual + " if runner._attn_ctx is not None else "last-token embed + "
+    ctx_note = (
+        "FULL-PROMPT attention→last residual + "
+        if runner._attn_ctx is not None
+        else "prompt mean-pool fallback + "
+    )
     _log(
         "[vindex-infer] path: **vindex walk (pure numpy)** — "
         f"{ctx_note}FFN gates×down_meta — "
