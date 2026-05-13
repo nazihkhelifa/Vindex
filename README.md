@@ -97,7 +97,9 @@ vindex_out/
 ├── tokenizer.json              # tokenizer of the source model
 ├── attn_centroids.bin          # (A-Vindex) MiniBatchKMeans centroids
 ├── attn_k_proj_weights.bin     # (A-Vindex) stored k_proj per layer × kv_head
-└── attn_index.json             # (A-Vindex) offsets, shapes
+├── attn_index.json             # (A-Vindex) offsets, shapes
+├── vindex_attn_ctx_index.json  # (walk) attention weights layout for prompt mixing
+└── vindex_attn_ctx_weights.bin # (walk) Q/V/O + input LN (+ Qwen q_norm/k_norm)
 ```
 
 Each weight bridges the "neural net" world and the "edge database" world:
@@ -107,13 +109,14 @@ Each weight bridges the "neural net" world and the "edge database" world:
 | `mlp.gate_proj.weight` (per layer) | Query vectors of a KNN index — each row is the "fingerprint" of an FFN feature | `gate_vectors.bin` |
 | `embed_tokens.weight` | Token → residual vector lookup | `embeddings.bin` |
 | `mlp.down_proj.weight @ embed.T` (per-feature logits) | Top-K tokens that fire when this feature activates → **label** | `down_meta.bin` |
-| `self_attn.k_proj.weight` (per layer × KV head) | Direction each attention head listens to → **stored verbatim** for the probe | `attn_k_proj_weights.bin` |
+| `self_attn.k_proj.weight` (per layer × KV head) | Stored verbatim for centroid probe + attention forward | `attn_k_proj_weights.bin` |
 | KMeans clusters of `k_proj × embed` | Compact "where vocab embeddings land under K" summary | `attn_centroids.bin` |
+| `self_attn.{q,v,o}_proj` + `input_layernorm` (+ optional `q_norm`/`k_norm`) | **Prompt-wide causal attention** (numpy): mix all prompt tokens, then FFN walk reads the last residual | `vindex_attn_ctx_*.bin/json` |
 
 Rows 1–3 are produced by `vindex.py`. Rows 4–5 are produced by
-`avindex_attention.py extract`. Both are file-level additions to the same
-vindex directory — they do not overlap, and the A-Vindex sidecar is purely
-additive.
+`avindex_attention.py extract` (centroid pass). Rows 6–7 are written **at the
+end of the same extract** (no second HF download) and power ``vindex-infer``'s
+attention-context path before the gate KNN.
 
 On the code side, `vindex.py` loads the safetensors, writes
 `gate_vectors.bin` layer by layer, and projects every column of
@@ -163,13 +166,26 @@ The `vindex.py` pipeline industrialises this view:
 
 ### The vindex walk (vindex-only INFER)
 
-`vindex-infer.py` runs a pure-numpy **walk INFER** that only uses the
-three files above:
+`vindex-infer.py` runs a pure-numpy **walk INFER** on ``gate_vectors.bin`` +
+``down_meta.bin``. The vector ``e`` that gets dotted into the gates is either:
+
+* **Attention context (default when `vindex_attn_ctx_*` exists)** — after
+  ``avindex_attention.py extract``, the vindex also stores Q/V/O projections,
+  input RMSNorm, optional Qwen ``q_norm``/``k_norm``, and reuses the stored
+  ``k_proj`` slices. For each transformer layer we run **one causal
+  self-attention block** over the full prompt (no FFN between layers), then
+  take ``e = h[-1]`` (the last position residual after all attention layers).
+  That is exactly *"what the model sees at the final position after mixing
+  France + capital + of + is through attention"*, up to f32 numpy fidelity.
+* **Last-token fallback** — if those files are missing or you set
+  ``VINDEX_NO_ATTN_CTX=1`` / ``--no-attention-context``, ``e`` is just
+  ``embed[last_token]`` (the old behaviour).
+
+Then for each FFN walk layer ``L``:
 
 ```text
-For each layer L:
-  scores = gate_vectors[L] @ embed[last_token]       # KNN per feature
-  top_features = argpartition(scores)[:K]            # K = features_per_layer
+  scores = gate_vectors[L] @ e
+  top_features = argpartition(scores)[:K]     # K = features_per_layer
   for f in top_features (positive scores only):
     for (token_id, logit) in down_meta[L][f].top_k:
       votes[token_id] += scores[f] × logit
@@ -177,11 +193,10 @@ For each layer L:
 softmax(votes)  →  top-k next tokens
 ```
 
-This is the simplest faithful "what would the FFN want to say"
-estimator. It is a **rough approximation** of the true forward pass —
-no attention, no real residual stream, no layer norms — but it stays
-honest: every term comes from a number stored on disk, and the whole
-prediction path is auditable.
+This is still **not** a full forward pass (no FFN up/down between layers, no
+final model norm, no lm_head logits) — but the attention half of your question
+is now real. For exact next-token parity use native ``larql`` on an
+``inference``-level vindex.
 
 When the native `larql` bindings are installed AND the vindex was
 built at `--level inference`, `vindex-infer.py` automatically delegates
@@ -280,6 +295,7 @@ out = av.probe_last_token_k_space(
 | `vindex-infernce-next.py` | **Multi-token chat** (walk loop or larql greedy) | **no** |
 | `avindex-infer.py` | **Centroid probe** + vindex walk top-k + optional scan | **no** |
 | `avindex-infer-next.py` | Chat with optional per-turn centroid probe annotation | **no** |
+| `vindex_attn_context.py` | NumPy attention forward + extract helper (imported by extract / infer) | **no** |
 
 All of them follow the same Colab convention: the scripts detect an
 empty argv (Jupyter cell), strip the parasitic `-f kernel.json`, and
@@ -304,6 +320,7 @@ VINDEX_PROMPT="The capital of France is"
 VINDEX_TOP_K=5
 VINDEX_WALK_FEATURES=32           # features kept per layer
 VINDEX_WALK_LAYERS=knowledge      # band name or comma list, e.g. "12,13,14"
+VINDEX_NO_ATTN_CTX=1              # skip attention forward; use last-token embed only
 
 # ── Chat / multi-token (vindex-infernce-next.py) ─────────────────────
 VNEXT_BUILD=1                     # extract before chat (HF download)
@@ -403,23 +420,30 @@ Any "dense" Hugging Face model using the standard
    memory before casting to `f32`. For Qwen3-0.6B that's ~2 GB, for
    Llama-3-8B plan ~32 GB. After extract, the inference scripts are
    modest (mmap'd embeddings + gates, in-memory down_meta).
-2. **Walk INFER is approximate** — the per-layer feature-vote scheme
-   skips real attention, residual mixing, and layer norms. Useful for
-   "where does the model want to land" exploration; not a faithful
-   reproduction of the model's outputs. For higher fidelity, use
-   `larql extract --level inference` and the native `larql` bindings.
-3. **A-Vindex = clustering approximation** — the centroid probe is a
-   geometric summary of K-space, not the runtime attention. We never
-   apply RoPE or sequence softmax in this repo.
-4. **f32 on disk** — `gate_vectors.bin`, `embeddings.bin`, and the
-   new `attn_k_proj_weights.bin` are all `float32`. Native LARQL can
-   write f16 (size ÷ 2); not here.
+2. **Walk INFER is approximate** — even with the attention-context path, we
+   still skip the **FFN** between transformer layers (no ``up_proj`` /
+   ``down_proj`` forward there), skip ``post_attention_layernorm``, skip the
+   final ``model.norm``, and approximate logits via ``down_meta`` top-K
+   votes instead of a full ``lm_head``. Native ``larql`` on an
+   ``inference``-level vindex is the supported path for exact next-token
+   parity.
+3. **A-Vindex centroid probe ≠ runtime attention** — the centroid probe is a
+   geometric summary of K-space (clustering), not the causal softmax path.
+   The **attention-context** walk, by contrast, does run real RoPE + causal
+   softmax attention using stored Q/K/V/O weights.
+4. **Attention-context disk** — ``vindex_attn_ctx_weights.bin`` is ~10 MiB
+   per layer on a 1k-hidden / 16-head model (~280 MiB for Qwen3-0.6B's 28
+   layers). It is written automatically at the end of ``avindex_attention.py
+   extract``. Older vindexes without these files keep the last-token fallback.
 5. **No real chat template** — `tokenizers.Tokenizer.from_file` reads
    the BPE/Unigram graph from `tokenizer.json` but not the Jinja2 chat
    template embedded in `tokenizer_config.json`. The chat scripts use a
    generic `USER:/ASSISTANT:` framing. The standalone `tokenizers`
    library is enough for everything in this repo — `transformers` is
    never imported by the inference path.
+6. **f32 on disk** — `gate_vectors.bin`, `embeddings.bin`,
+   `attn_k_proj_weights.bin`, and `vindex_attn_ctx_weights.bin` are all
+   `float32`. Native LARQL can write f16 (size ÷ 2); not here.
 
 ---
 
@@ -436,8 +460,9 @@ The files produced honour the LARQL binary format:
   top_k × (u32 token_id, f32 logit)]`). The Rust decoder lives in
   [`crates/larql-vindex/src/format/down_meta.rs`](../larql-main/crates/larql-vindex/src/format/down_meta.rs).
 - The A-Vindex files (`attn_centroids.bin`, `attn_k_proj_weights.bin`,
-  `attn_index.json` with `avindex_version: 3`) are specific to this
-  toolkit — LARQL doesn't read them today.
+  `attn_index.json` with `avindex_version: 3`) and the attention-context
+  files (`vindex_attn_ctx_*.json/bin`) are specific to this toolkit —
+  LARQL doesn't read them today.
 
 Practical consequence: a vindex produced here can be read by
 `larql repl` or by the `larql._native` bindings *in browse mode*

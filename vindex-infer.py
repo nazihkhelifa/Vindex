@@ -9,9 +9,12 @@ Two execution paths, both vindex-native:
    ``--level inference`` or ``all``): delegate to ``larql.load(...).infer(...)``
    for the accurate Walk-FFN forward pass.
 2. **Pure-numpy walk** (always works, including browse-only vindex from
-   ``vindex.py``): for every layer, score the gate vectors against the
-   last-token embedding, gather the top-features' ``down_meta`` votes, and
-   softmax. Fast approximation; quality depends on prompt and layer band.
+   ``vindex.py``): run **multi-head causal attention** over the full prompt
+   (when ``vindex_attn_ctx_*.bin`` are present — produced by the latest
+   ``avindex_attention.py extract``), take the **last-position residual**, then
+   for each FFN layer score ``gate_vectors @ residual`` and vote via
+   ``down_meta``. If the sidecar is missing, falls back to the last-token
+   embedding only.
 
 The tokenizer is read from ``<vindex>/tokenizer.json`` directly via the
 ``tokenizers`` package — no ``AutoTokenizer.from_pretrained`` call, no HF
@@ -23,10 +26,12 @@ Environment (cell mode, no CLI):
   VINDEX_TOP_K           int (default: 5)
   VINDEX_WALK_LAYERS     comma list, e.g. "12,13,14" or band name "knowledge"
   VINDEX_WALK_FEATURES   features kept per layer (default: 32)
+  VINDEX_NO_ATTN_CTX=1   force last-token embedding only (skip attention forward)
 
 CLI:
   python vindex-infer.py --vindex ./.larql_colab/vindex_out -p "Hello" --top-k 5
   python vindex-infer.py --vindex ./.larql_colab/vindex_out -p "Hi" --layers knowledge
+  python vindex-infer.py --vindex ./.larql_colab/vindex_out -p "Hi" --no-attention-context
 
 Dependencies:
   pip install numpy tokenizers
@@ -84,6 +89,10 @@ def load_index(vindex_dir: Path) -> dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── DMET v1 parser (down_meta.bin) ────────────────────────────────────────
 
 DMET_MAGIC = 0x444D4554  # "DMET"
@@ -132,18 +141,25 @@ def _parse_down_meta(buf: bytes) -> tuple[list[list[list[tuple[int, float]] | No
 class VindexWalkRunner:
     """
     Vindex-only INFER. Reads ``embeddings.bin``, ``gate_vectors.bin``,
-    ``down_meta.bin`` and ``tokenizer.json`` — nothing else.
+    ``down_meta.bin`` and ``tokenizer.json``. Optionally loads
+    ``vindex_attn_ctx_*.bin`` (from ``avindex_attention.py extract``) to run a
+    **full causal self-attention stack** over the prompt and feed the **last
+    position residual** into the FFN walk — mixing all prompt tokens through
+    attention before the gate KNN.
 
     Algorithm (per prediction step):
-      1. Look up the last token's embedding row.
-      2. For each layer (or chosen band), score ``gate_vectors[layer] @ e``.
-      3. Keep the top-``features_per_layer`` positive-scoring features.
-      4. For every kept feature, fetch its ``down_meta`` top-K vocab pairs and
-         add ``feature_score × logit`` into a vocab-sized vote accumulator.
-      5. Softmax the accumulator, take top-``top_k``.
+      1. Tokenise the prompt; build ``h`` from token embeddings.
+      2. If attention-context sidecar is loaded: for each transformer layer,
+         apply pre-norm RMSNorm → Q/K/V projections (K read from stored
+         ``k_proj``) → optional Qwen ``q_norm``/``k_norm`` → RoPE → causal
+         softmax attention → ``o_proj``; ``h += attn_out`` (no FFN between
+         layers). Take ``e = h[-1]``.
+         Else: ``e = embed[last_token]``.
+      3. For each FFN walk layer, score ``gate_vectors[layer] @ e``, keep top
+         features, accumulate ``down_meta`` votes, softmax → top-k.
     """
 
-    def __init__(self, vindex_dir: Path) -> None:
+    def __init__(self, vindex_dir: Path, *, use_attention_context: bool | None = None) -> None:
         self.vindex_dir = Path(vindex_dir).resolve()
         self.idx = load_index(self.vindex_dir)
         self.hidden = int(self.idx["hidden_size"])
@@ -178,6 +194,25 @@ class VindexWalkRunner:
         # tokenizer from vindex (no HF model id required)
         self.tok = self._load_tokenizer()
 
+        self._attn_ctx: Any | None = None
+        ctx_idx = self.vindex_dir / "vindex_attn_ctx_index.json"
+        ctx_w = self.vindex_dir / "vindex_attn_ctx_weights.bin"
+        files_ok = ctx_idx.is_file() and ctx_w.is_file()
+        if use_attention_context is False:
+            want = False
+        elif use_attention_context is True:
+            want = True
+        else:
+            want = files_ok and not _env_truthy("VINDEX_NO_ATTN_CTX")
+        if want:
+            try:
+                from vindex_attn_context import AttnContextForward
+
+                self._attn_ctx = AttnContextForward(self.vindex_dir)
+            except Exception as e:  # noqa: BLE001
+                _log(f"[vindex-infer] attention-context unavailable ({e}); using last-token embedding")
+                self._attn_ctx = None
+
     def _load_tokenizer(self) -> Any:
         p = self.vindex_dir / "tokenizer.json"
         if not p.is_file():
@@ -189,6 +224,15 @@ class VindexWalkRunner:
         except ImportError as e:
             raise SystemExit("Install the `tokenizers` package: pip install tokenizers") from e
         return Tokenizer.from_file(str(p))
+
+    def embedding_for_ffn_walk(self, token_ids: list[int]) -> np.ndarray:
+        """Last-position vector fed into the FFN gate KNN: attention-mixed
+        residual when ``_attn_ctx`` is loaded, else last-token embedding."""
+        if self._attn_ctx is not None:
+            return self._attn_ctx.last_residual_after_attention(
+                self.embed, self.embed_scale, token_ids
+            )
+        return np.asarray(self.embed[int(token_ids[-1])], dtype=np.float32) * self.embed_scale
 
     # ── public helpers ────────────────────────────────────────────────────
 
@@ -233,14 +277,14 @@ class VindexWalkRunner:
 
     def _predict_step_ids(
         self,
-        last_token_id: int,
+        token_ids: list[int],
         *,
         top_k: int,
         features_per_layer: int,
         layers: list[int],
     ) -> tuple[np.ndarray, np.ndarray]:
         """Internal: returns ``(top_token_ids, top_probs)`` as numpy arrays."""
-        e = np.asarray(self.embed[last_token_id], dtype=np.float32) * self.embed_scale
+        e = self.embedding_for_ffn_walk(token_ids)
         votes = np.zeros(self.vocab, dtype=np.float32)
         for layer in layers:
             gates = self.gates_layer(layer)
@@ -281,16 +325,16 @@ class VindexWalkRunner:
 
     def predict_step(
         self,
-        last_token_id: int,
+        token_ids: list[int],
         *,
         top_k: int = 5,
         features_per_layer: int = 32,
         layers: list[int] | str | None = None,
     ) -> list[tuple[int, str, float]]:
-        """Top-``top_k`` next-token predictions from a single last-token id."""
+        """Top-``top_k`` next-token predictions from a full prompt token id list."""
         layers_resolved = self.resolve_layers(layers)
         ids, probs = self._predict_step_ids(
-            int(last_token_id),
+            token_ids,
             top_k=top_k,
             features_per_layer=features_per_layer,
             layers=layers_resolved,
@@ -310,7 +354,7 @@ class VindexWalkRunner:
     ) -> list[tuple[str, float]]:
         ids = self.encode(prompt)
         preds = self.predict_step(
-            ids[-1],
+            ids,
             top_k=top_k,
             features_per_layer=features_per_layer,
             layers=layers,
@@ -327,17 +371,16 @@ class VindexWalkRunner:
         stop_token_ids: list[int] | None = None,
         on_token: Callable[[str], None] | None = None,
     ) -> str:
-        """Greedy multi-token generation. Uses the latest emitted token as the
-        next residual seed — this is a coarse approximation (no real attention,
-        no context aggregation beyond the embedding lookup), kept here so the
-        whole stack stays vindex-only."""
+        """Greedy multi-token generation. Each step re-runs attention over the
+        full prefix when the attention-context sidecar is loaded, then the FFN
+        walk for the next token."""
         ids = self.encode(prompt)
         layers_resolved = self.resolve_layers(layers)
         stop = set(int(x) for x in (stop_token_ids or []))
         out_ids: list[int] = []
         for _ in range(int(max_new_tokens)):
             top_ids, _ = self._predict_step_ids(
-                int(ids[-1]),
+                ids,
                 top_k=1,
                 features_per_layer=features_per_layer,
                 layers=layers_resolved,
@@ -404,6 +447,7 @@ def run_infer(
     features_per_layer: int = 32,
     layers: list[int] | str | None = None,
     runner: VindexWalkRunner | None = None,
+    use_attention_context: bool | None = None,
 ) -> list[tuple[str, float]]:
     vindex_dir = vindex_dir.resolve()
     _log("=" * 60)
@@ -421,7 +465,7 @@ def run_infer(
     own_runner = runner is None
     if own_runner:
         t0 = time.perf_counter()
-        runner = VindexWalkRunner(vindex_dir)
+        runner = VindexWalkRunner(vindex_dir, use_attention_context=use_attention_context)
         _log(f"[vindex-infer] runner ready in {time.perf_counter() - t0:.2f}s")
     assert runner is not None
 
@@ -429,13 +473,15 @@ def run_infer(
     out = runner.infer_topk(
         prompt, top_k=top_k, features_per_layer=features_per_layer, layers=layers
     )
+    ctx_note = "attention→last residual + " if runner._attn_ctx is not None else "last-token embed + "
     _log(
         "[vindex-infer] path: **vindex walk (pure numpy)** — "
+        f"{ctx_note}FFN gates×down_meta — "
         f"layers={runner.resolve_layers(layers)[:1]}…{runner.resolve_layers(layers)[-1:]} "
         f"step={time.perf_counter() - t1:.2f}s"
     )
     for i, (tok, pr) in enumerate(out, 1):
-        _log(f"  {i:2}. p={pr:.4f}  {tok!r}")
+        _log(f"  {i:2}. p={pr:.4e}  {tok!r}")
     _log("=" * 60)
     return out
 
@@ -461,7 +507,8 @@ def run_default_cell() -> None:
     top_k = int(os.environ.get("VINDEX_TOP_K", "5"))
     features = int(os.environ.get("VINDEX_WALK_FEATURES", "32"))
     layers = _parse_layers_env(os.environ.get("VINDEX_WALK_LAYERS"))
-    run_infer(vd, prompt, top_k, features_per_layer=features, layers=layers)
+    use_ctx = False if _env_truthy("VINDEX_NO_ATTN_CTX") else None
+    run_infer(vd, prompt, top_k, features_per_layer=features, layers=layers, use_attention_context=use_ctx)
 
 
 def main_cli() -> None:
@@ -480,16 +527,23 @@ def main_cli() -> None:
         default=os.environ.get("VINDEX_WALK_LAYERS", ""),
         help='comma list (e.g. "12,13,14") or band name ("syntax", "knowledge", "output"); default = all',
     )
+    ap.add_argument(
+        "--no-attention-context",
+        action="store_true",
+        help="use last-token embedding only (ignore vindex_attn_ctx_* if present)",
+    )
     args, rest = ap.parse_known_args(user_argv())
     if rest:
         _log(f"[vindex-infer] warning: ignored argv: {rest}")
     layers = _parse_layers_env(args.layers) if args.layers else None
+    use_ctx = False if args.no_attention_context else None
     run_infer(
         args.vindex.resolve(),
         args.prompt,
         args.top_k,
         features_per_layer=args.features_per_layer,
         layers=layers,
+        use_attention_context=use_ctx,
     )
 
 

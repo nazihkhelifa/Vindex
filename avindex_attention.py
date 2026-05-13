@@ -18,8 +18,10 @@ What this module does
 Layout (alongside an existing browse vindex directory)
 ------------------------------------------------------
   <vindex_dir>/attn_centroids.bin       # MiniBatchKMeans centroids, f32
-  <vindex_dir>/attn_k_proj_weights.bin  # full k_proj per layer, f32  (NEW)
+  <vindex_dir>/attn_k_proj_weights.bin  # full k_proj per layer, f32
   <vindex_dir>/attn_index.json          # offsets, shapes, k_proj layout
+  <vindex_dir>/vindex_attn_ctx_weights.bin   # Q/V/O + input LN (+ optional Qwen q_norm/k_norm)
+  <vindex_dir>/vindex_attn_ctx_index.json    # byte layout for the above
 
 Dependencies
 ------------
@@ -339,6 +341,12 @@ def extract_attention_avindex(
         f"DONE  centroids={sz_mb:.2f} MiB  k_proj={sz_k_mb:.2f} MiB  "
         f"total {time.perf_counter() - t_all:.1f}s"
     )
+    try:
+        from vindex_attn_context import extract_attn_context_sidecar
+
+        extract_attn_context_sidecar(out_dir, sd=sd, prefix=prefix, cfg=cfg, vx=vx)
+    except Exception as e:  # noqa: BLE001
+        _log(f"warning: attention-context sidecar skipped: {e}")
     return out_dir
 
 

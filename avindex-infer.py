@@ -223,7 +223,15 @@ def run_walk_topk(
 ) -> list[dict[str, Any]]:
     """Pure-numpy FFN walk top-k prediction (same as ``vindex-infer.py``)."""
     inf = load_vindex_infer()
-    runner = inf.VindexWalkRunner(vindex_dir.resolve())
+    runner = inf.VindexWalkRunner(
+        vindex_dir.resolve(),
+        use_attention_context=(
+            False
+            if os.environ.get("VINDEX_NO_ATTN_CTX", "").strip().lower()
+            in ("1", "true", "yes", "on")
+            else None
+        ),
+    )
     preds = runner.infer_topk(
         prompt, top_k=top_k, features_per_layer=features_per_layer, layers=layers
     )

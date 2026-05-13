@@ -216,7 +216,10 @@ class VindexConversationalSession:
 
         _log("[vnxt] path: **vindex walk (pure numpy)** — greedy multi-step on browse vindex")
         t0 = time.perf_counter()
-        self._runner = self._inf.VindexWalkRunner(self.vindex_dir)
+        use_ctx: bool | None = None
+        if os.environ.get("VINDEX_NO_ATTN_CTX", "").strip().lower() in ("1", "true", "yes", "on"):
+            use_ctx = False
+        self._runner = self._inf.VindexWalkRunner(self.vindex_dir, use_attention_context=use_ctx)
         _log(f"[vnxt] runner ready in {time.perf_counter() - t0:.2f}s")
 
     def messages_to_prompt(self, messages: list[dict[str, str]]) -> str:
