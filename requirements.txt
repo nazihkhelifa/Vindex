@@ -1,38 +1,15 @@
-# ──────────────────────────────────────────────────────────────────────
-# Python dependencies for the Vindex / A-Vindex toolkit
+# Dépendances Python — dépôt Vindex (inférence + métadonnées attention)
 #
-# Inference is **vindex-only**: nothing here loads a Hugging Face model
-# for prediction. The `transformers` / `accelerate` / `sentencepiece`
-# packages are intentionally absent — they were only used by the old
-# HF inference fallbacks, which have been removed.
+# vindex_infer_python.py / vindex_infer_ffn_att.py :
+#   numpy (obligatoire)
+#   tokenizers (recommandé : --prompt et décodage des tops)
 #
-# `larql` (the native PyO3 bindings) stays optional and is NOT installed
-# via this file. When present, vindex-infer.py uses it as a fast path
-# on vindexes built at `--level inference` or higher.
+# build_attn_semantic_meta.py :
+#   torch (+ numpy) ; tqdm améliore seulement la barre de progression
 #
-# Two install profiles:
-#
-#   1. Minimum (run an existing vindex — no extraction):
-#          pip install numpy tokenizers
-#      Enough for vindex-infer.py, vindex-infernce-next.py,
-#      avindex-infer.py (probe/walk/scan), avindex-infer-next.py.
-#
-#   2. Full (also lets you build vindexes from a HF model):
-#          pip install -r requirements.txt
-# ──────────────────────────────────────────────────────────────────────
+# Installation : pip install -r requirements.txt
 
-# ── Inference (always required): vindex walk + tokenizer ──────────────
 numpy>=1.24
 tokenizers>=0.19
-
-# ── Extraction only (vindex.py + avindex_attention.py extract) ────────
-# Imported lazily, inside extract_* functions — the inference path
-# never touches these packages.
 torch>=2.1
-safetensors>=0.4
-huggingface_hub>=0.23
-
-# ── A-Vindex attention sidecar build only ─────────────────────────────
-# MiniBatchKMeans clustering of k_proj × embed projections at extract
-# time. Not used at probe / scan / walk time.
-scikit-learn>=1.3
+tqdm>=4.65
