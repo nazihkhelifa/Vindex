@@ -1,19 +1,19 @@
-# Vindex — inférence Python
+# Vindex — Python inference
 
-Petit dépôt d’**outils Python** autour d’un répertoire **Vindex** déjà produit (par exemple avec **LarQL** / `larql extract`). Il n’y a pas ici d’extracteur Hugging Face : on suppose que vous avez un dossier contenant au minimum `index.json`, les binaires attendus (`embeddings.bin`, `gate_vectors.bin`, etc.) et, pour le forward complet, les poids attention / FFN selon le niveau d’extraction.
+Small set of **Python tools** around an existing **Vindex** directory (for example produced with **LarQL** / `larql extract`). There is **no** Hugging Face extractor here: you are expected to have a folder with at least `index.json`, the expected binaries (`embeddings.bin`, `gate_vectors.bin`, etc.), and for a full forward pass the attention / FFN weights according to the extract level.
 
-## Contenu du dépôt
+## Repository layout
 
-| Fichier | Rôle |
-|--------|------|
-| `vindex_infer_python.py` | Port Python de l’inférence type `vindex-infer` (Rust) : charge le Vindex en **f16** (mmap), forward **attention + FFN** ou ablation `--forward ffn-only`, logits via **tête LM liée** à `embeddings.bin`. |
-| `vindex_infer_ffn_att.py` | Même moteur que ci-dessus, avec en plus l’option **`--attn-meta`** pour afficher un résumé des libellés sémantiques **Option C** (`attn_meta.bin`). |
-| `build_attn_semantic_meta.py` | Construit `attn_meta.bin` (et optionnellement `attn_meta_scores.bin`) à partir de `attn_weights.bin` + `embeddings.bin`, et met à jour `index.json` (`attention_metadata`). Nécessite **PyTorch** (accélération GPU possible). |
+| File | Purpose |
+|------|---------|
+| `vindex_infer_python.py` | Python port of Rust-style `vindex-infer`: loads the Vindex in **f16** (mmap), **attention + FFN** forward or `--forward ffn-only` ablation, logits via the **tied LM head** on `embeddings.bin`. |
+| `vindex_infer_ffn_att.py` | Same engine as above, plus **`--attn-meta`** to print a short summary of **Option C** semantic labels (`attn_meta.bin`). |
+| `build_attn_semantic_meta.py` | Builds `attn_meta.bin` (and optionally `attn_meta_scores.bin`) from `attn_weights.bin` + `embeddings.bin`, and updates `index.json` (`attention_metadata`). Requires **PyTorch** (optional GPU acceleration). |
 
-## Prérequis
+## Prerequisites
 
-- **Python 3.10+** recommandé.
-- Un répertoire **Vindex** valide (niveau au moins compatible avec attention si vous voulez le chemin « full » sans sauter l’attention).
+- **Python 3.10+** recommended.
+- A valid **Vindex** directory (extract level must include attention weights if you want the full path without skipping attention).
 
 ## Installation
 
@@ -21,36 +21,36 @@ Petit dépôt d’**outils Python** autour d’un répertoire **Vindex** déjà 
 pip install -r requirements.txt
 ```
 
-**Profil minimal** (sans construire `attn_meta`) : `numpy` + `tokenizers` suffisent pour lancer l’inférence avec `--prompt` si `tokenizer.json` est dans le Vindex. Le script `build_attn_semantic_meta.py` exige en plus **PyTorch** (voir `requirements.txt`).
+**Minimal profile** (without building `attn_meta`): `numpy` + `tokenizers` are enough to run inference with `--prompt` if `tokenizer.json` sits inside the Vindex. `build_attn_semantic_meta.py` additionally needs **PyTorch** (see `requirements.txt`).
 
-## Exemples d’utilisation
+## Usage examples
 
-Inférence (IDs explicites ou prompt texte) :
-
-```bash
-python vindex_infer_python.py --vindex ./chemin/vers/modele.vindex --token-ids 818,5279,529,7001,563
-python vindex_infer_python.py --vindex ./chemin/vers/modele.vindex -p "The capital of France is"
-```
-
-Même chose avec résumé **attn_meta** après le forward :
+Inference (explicit token IDs or text prompt):
 
 ```bash
-python vindex_infer_ffn_att.py --vindex ./chemin/vers/modele.vindex -p "Hello" --attn-meta --attn-meta-layer 20
+python vindex_infer_python.py --vindex ./path/to/model.vindex --token-ids 818,5279,529,7001,563
+python vindex_infer_python.py --vindex ./path/to/model.vindex -p "The capital of France is"
 ```
 
-Génération des métadonnées attention « Option C » :
+Same with an **attn_meta** summary after the forward:
 
 ```bash
-python build_attn_semantic_meta.py --vindex ./chemin/vers/modele.vindex --top-k 20
-python build_attn_semantic_meta.py --vindex ./chemin/vers/modele.vindex --cpu
+python vindex_infer_ffn_att.py --vindex ./path/to/model.vindex -p "Hello" --attn-meta --attn-meta-layer 20
 ```
 
-Logs : par défaut **INFO** sur stderr ; `-v` = DEBUG, `-q` = WARNING.
+Build attention metadata (“Option C”):
+
+```bash
+python build_attn_semantic_meta.py --vindex ./path/to/model.vindex --top-k 20
+python build_attn_semantic_meta.py --vindex ./path/to/model.vindex --cpu
+```
+
+Logging: **INFO** on stderr by default; `-v` = DEBUG, `-q` = WARNING.
 
 ## Windows / PowerShell
 
-Les exemples ci-dessus fonctionnent tels quels. Pour des variables d’environnement, utilisez la syntaxe PowerShell (`$env:NOM="valeur"`) plutôt que `NOM=valeur commande`.
+The commands above work as-is. For environment variables, use PowerShell syntax (`$env:NAME="value"`) instead of Unix `NAME=value command`.
 
-## Licence
+## License
 
-Apache-2.0 — alignée sur l’écosystème LarQL / Vindex lorsque applicable.
+Apache-2.0 — consistent with the LarQL / Vindex ecosystem where applicable.
