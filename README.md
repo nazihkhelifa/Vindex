@@ -9,7 +9,6 @@ Petit dépôt d’**outils Python** autour d’un répertoire **Vindex** déjà 
 | `vindex_infer_python.py` | Port Python de l’inférence type `vindex-infer` (Rust) : charge le Vindex en **f16** (mmap), forward **attention + FFN** ou ablation `--forward ffn-only`, logits via **tête LM liée** à `embeddings.bin`. |
 | `vindex_infer_ffn_att.py` | Même moteur que ci-dessus, avec en plus l’option **`--attn-meta`** pour afficher un résumé des libellés sémantiques **Option C** (`attn_meta.bin`). |
 | `build_attn_semantic_meta.py` | Construit `attn_meta.bin` (et optionnellement `attn_meta_scores.bin`) à partir de `attn_weights.bin` + `embeddings.bin`, et met à jour `index.json` (`attention_metadata`). Nécessite **PyTorch** (accélération GPU possible). |
-| `GUIDE_VINDEX_FFN_LARQL.md` | Guide sur le FFN dans le format Vindex côté crate `larql-vindex` (LarQL). |
 
 ## Prérequis
 
