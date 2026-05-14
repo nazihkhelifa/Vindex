@@ -1,15 +1,18 @@
-# Dépendances Python — dépôt Vindex (inférence + métadonnées attention)
+# Python deps — LarQL-style Vindex inference + attention metadata (Python)
 #
-# vindex_infer_python.py / vindex_infer_ffn_att.py :
-#   numpy (obligatoire)
-#   tokenizers (recommandé : --prompt et décodage des tops)
+# Inference (vindex_infer_python.py, vindex_infer_ffn_att.py):
+#   numpy (required), tokenizers (recommended for --prompt)
 #
-# build_attn_semantic_meta.py :
-#   torch (+ numpy) ; tqdm améliore seulement la barre de progression
+# Attention semantic meta (build_attn_semantic_meta.py):
+#   torch, numpy; tqdm optional for progress
 #
-# Installation : pip install -r requirements.txt
+# Download a ready-made Vindex from the Hub (download_vindex_from_hf.py):
+#   huggingface_hub
+#
+# Install: pip install -r requirements.txt
 
 numpy>=1.24
 tokenizers>=0.19
 torch>=2.1
 tqdm>=4.65
+huggingface_hub>=0.23
